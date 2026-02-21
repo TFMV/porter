@@ -12,7 +12,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	_ "github.com/marcboeker/go-duckdb/v2"
+	_ "github.com/duckdb/duckdb-go/v2"
 	"github.com/rs/zerolog"
 
 	pkgerrors "github.com/TFMV/porter/pkg/errors"
