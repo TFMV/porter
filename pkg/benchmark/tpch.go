@@ -16,7 +16,7 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/memory"
 	"github.com/rs/zerolog"
 
-	_ "github.com/marcboeker/go-duckdb/v2"
+	_ "github.com/duckdb/duckdb-go/v2"
 )
 
 // BenchmarkConfig holds configuration for TPC-H benchmarks.

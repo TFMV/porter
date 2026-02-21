@@ -41,7 +41,7 @@ import (
 
 	"github.com/TFMV/porter/cmd/server/middleware"
 
-	_ "github.com/marcboeker/go-duckdb/v2"
+	_ "github.com/duckdb/duckdb-go/v2"
 )
 
 var (

@@ -7,7 +7,7 @@ import (
 	"log"
 	"strings"
 
-	_ "github.com/marcboeker/go-duckdb/v2"
+	_ "github.com/duckdb/duckdb-go/v2"
 )
 
 func main() {
