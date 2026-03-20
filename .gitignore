@@ -28,3 +28,9 @@ Dockerfile
 .dockerignore
 data/
 python/
+
+# Python
+*.pyc
+__pycache__/
+venv/
+.venv/

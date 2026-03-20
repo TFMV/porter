@@ -1,0 +1,14 @@
+{
+    "dockerComposeFile": "compose.yaml",
+    "service": "devcontainer",
+    "workspaceFolder": "/workspaces/porter",
+    "customizations": {
+        "vscode": {
+            "settings": {
+                "python.defaultInterpreterPath": "/usr/local/bin/python"
+            },
+                "extensions": ["golang.go", "ms-python.python"]
+            }
+    },
+    "remoteUser": "root"
+}

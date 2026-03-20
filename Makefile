@@ -448,10 +448,10 @@ docker-stop: ## Stop Docker container
 # Integration Testing
 # =============================================================================
 
-.PHONY: integration-test
-integration-test: build ## Run integration tests with Python
+.PHONY: integration-test-python
+integration-test-python: build ## Run integration tests with Python
 	$(call print_info,Running Python integration tests...)
-	@cd test/integration && python3 simple_test.py
+	@cd test/integration && uv run pytest
 	$(call print_success,Python integration tests completed)
 
 .PHONY: integration-test-java

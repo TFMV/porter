@@ -1,0 +1,9 @@
+[project]
+name = "flight-sql-integration-test"
+version = "0.1.0"
+requires-python = "==3.10.17"
+dependencies = [
+    "pyarrow==21.0.0",
+    "pytest==8.4.1",
+    "adbc-driver-flightsql==1.7.0"
+]

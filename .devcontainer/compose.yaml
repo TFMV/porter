@@ -1,0 +1,9 @@
+services:
+  devcontainer:
+    build:
+      dockerfile: .devcontainer/dev.Dockerfile
+      context: ..
+    command: sleep infinity
+    volumes:
+      - ..:/workspaces/porter
+      # - /var/run/docker.sock:/var/run/docker.sock
