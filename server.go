@@ -36,8 +36,6 @@ type ExecTicket struct {
 	PreparedID string `json:"prepared_id,omitempty"`
 
 	QueryID string `json:"query_id"`
-	Shard   int    `json:"shard"`
-	Total   int    `json:"total"`
 }
 
 func encodeTicket(t ExecTicket) []byte {
@@ -47,7 +45,8 @@ func encodeTicket(t ExecTicket) []byte {
 
 func decodeTicket(b []byte) (ExecTicket, error) {
 	var t ExecTicket
-	return t, json.Unmarshal(b, &t)
+	err := json.Unmarshal(b, &t)
+	return t, err
 }
 
 func hashSQL(sql string) string {
@@ -113,65 +112,44 @@ type Server struct {
 	allocator memory.Allocator
 	pool      *connPool
 	prepared  sync.Map
-
-	shards int
 }
 
-func NewServer(shards int) *Server {
-	if shards <= 0 {
-		shards = 1
-	}
-
+func NewServer() *Server {
 	return &Server{
 		allocator: memory.NewGoAllocator(),
 		pool:      newPool(),
-		shards:    shards,
 	}
 }
 
-// Handshake implements a streaming authentication handshake.
-// It supports multi-message negotiation, respects context cancellation,
-// and returns structured errors suitable for production observability.
+//
+// ─────────────────────────────────────────────
+// HANDSHAKE
+// ─────────────────────────────────────────────
+//
+
 func (s *Server) Handshake(stream flight.FlightService_HandshakeServer) error {
 	ctx := stream.Context()
 
 	for {
-		// Respect cancellation / deadline early (critical for gRPC hygiene)
 		if err := ctx.Err(); err != nil {
 			return status.Error(codes.Canceled, err.Error())
 		}
 
 		req, err := stream.Recv()
 		if err != nil {
-			// Proper EOF handling = clean stream termination
 			if errors.Is(err, io.EOF) {
 				return nil
 			}
-
-			// Preserve transport semantics while wrapping for observability
 			return status.Errorf(codes.Internal, "handshake recv failed: %v", err)
 		}
 
-		// Defensive check: empty payload should never silently pass
 		if len(req.Payload) == 0 {
 			return status.Error(codes.Unauthenticated, "empty handshake payload")
 		}
 
-		// ─────────────────────────────────────────────
-		// AUTH / TOKEN PROCESSING HOOK
-		// ─────────────────────────────────────────────
-		token := req.Payload
-
-		// (placeholder for real validation)
-		// if err := s.auth.Validate(token); err != nil {
-		//     return status.Errorf(codes.Unauthenticated, "invalid token: %v", err)
-		// }
-
-		resp := &flight.HandshakeResponse{
-			Payload: token,
-		}
-
-		if err := stream.Send(resp); err != nil {
+		if err := stream.Send(&flight.HandshakeResponse{
+			Payload: req.Payload,
+		}); err != nil {
 			return status.Errorf(codes.Internal, "handshake send failed: %v", err)
 		}
 	}
@@ -243,7 +221,7 @@ func (s *Server) ListActions(
 
 //
 // ─────────────────────────────────────────────
-// LIST FLIGHTS (optional but required by client)
+// LIST FLIGHTS
 // ─────────────────────────────────────────────
 //
 
@@ -251,13 +229,12 @@ func (s *Server) ListFlights(
 	_ *flight.Criteria,
 	stream flight.FlightService_ListFlightsServer,
 ) error {
-	// minimal implementation
 	return nil
 }
 
 //
 // ─────────────────────────────────────────────
-// GET FLIGHT INFO
+// GET FLIGHT INFO (SINGLE ENDPOINT ONLY)
 // ─────────────────────────────────────────────
 //
 
@@ -291,34 +268,27 @@ func (s *Server) GetFlightInfo(ctx context.Context, desc *flight.FlightDescripto
 	defer reader.Release()
 
 	schema := serializeSchema(reader.Schema())
-
 	queryID := hashSQL(sql) + fmt.Sprintf("-%d", time.Now().UnixNano())
 
-	var endpoints []*flight.FlightEndpoint
-
-	for i := 0; i < s.shards; i++ {
-		endpoints = append(endpoints, &flight.FlightEndpoint{
-			Ticket: &flight.Ticket{
-				Ticket: encodeTicket(ExecTicket{
-					Type:    t.Type,
-					SQL:     sql,
-					QueryID: queryID,
-					Shard:   i,
-					Total:   s.shards,
-				}),
-			},
-		})
+	endpoint := &flight.FlightEndpoint{
+		Ticket: &flight.Ticket{
+			Ticket: encodeTicket(ExecTicket{
+				Type:    t.Type,
+				SQL:     sql,
+				QueryID: queryID,
+			}),
+		},
 	}
 
 	return &flight.FlightInfo{
 		Schema:   schema,
-		Endpoint: endpoints,
+		Endpoint: []*flight.FlightEndpoint{endpoint},
 	}, nil
 }
 
 //
 // ─────────────────────────────────────────────
-// DOGET
+// DO GET (SINGLE STREAM EXECUTION)
 // ─────────────────────────────────────────────
 //
 
@@ -363,83 +333,7 @@ func (s *Server) DoGet(ticket *flight.Ticket, stream flight.FlightService_DoGetS
 
 //
 // ─────────────────────────────────────────────
-// DOEXCHANGE
-// ─────────────────────────────────────────────
-//
-
-func (s *Server) DoExchange(stream flight.FlightService_DoExchangeServer) error {
-
-	ctx := stream.Context()
-
-	for {
-		in, err := stream.Recv()
-		if errors.Is(err, io.EOF) {
-			return nil
-		}
-		if err != nil {
-			return err
-		}
-
-		t, err := decodeTicket(in.DataHeader)
-		if err != nil {
-			return err
-		}
-
-		var wg sync.WaitGroup
-		errCh := make(chan error, s.shards)
-
-		for i := 0; i < s.shards; i++ {
-			wg.Add(1)
-
-			go func() {
-				defer wg.Done()
-
-				conn, err := s.pool.get(ctx)
-				if err != nil {
-					errCh <- err
-					return
-				}
-				defer s.pool.put(conn)
-
-				stmt, _ := conn.NewStatement()
-				defer stmt.Close()
-
-				_ = stmt.SetSqlQuery(t.SQL)
-
-				reader, _, err := stmt.ExecuteQuery(ctx)
-				if err != nil {
-					errCh <- err
-					return
-				}
-				defer reader.Release()
-
-				for reader.Next() {
-					data, _ := encodeRecord(reader.Record())
-
-					if err := stream.Send(&flight.FlightData{
-						DataBody: data,
-					}); err != nil {
-						errCh <- err
-						return
-					}
-				}
-			}()
-		}
-
-		wg.Wait()
-		close(errCh)
-
-		for e := range errCh {
-			if e != nil {
-				return e
-			}
-		}
-	}
-}
-
-//
-// ─────────────────────────────────────────────
-// DOACTION
+// DO ACTION (PREPARED STATEMENTS)
 // ─────────────────────────────────────────────
 //
 
@@ -501,16 +395,4 @@ func serializeSchema(schema *arrow.Schema) []byte {
 	w := ipc.NewWriter(&buf, ipc.WithSchema(schema))
 	_ = w.Close()
 	return buf.Bytes()
-}
-
-func encodeRecord(rec arrow.Record) ([]byte, error) {
-	var buf bytes.Buffer
-	w := ipc.NewWriter(&buf, ipc.WithSchema(rec.Schema()))
-	defer w.Close()
-
-	if err := w.Write(rec); err != nil {
-		return nil, err
-	}
-
-	return buf.Bytes(), nil
 }
