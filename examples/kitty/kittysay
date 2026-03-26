@@ -1,9 +1,0 @@
-#!/bin/bash
-# kittysay — the simplest cat shell ever
-
-quote=$(cat -)
-cat <<EOF
- /\_/\  
-( o.o )  $quote
- > ^ <
-EOF
