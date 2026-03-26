@@ -29,7 +29,6 @@ func main() {
 
 	log.Info("starting flight sql server",
 		"addr", cfg.addr,
-		"shards", cfg.shards,
 		"max_recv_mb", cfg.maxRecvMB,
 		"max_send_mb", cfg.maxSendMB,
 	)
@@ -40,7 +39,8 @@ func main() {
 		os.Exit(1)
 	}
 
-	srv := flightsql.NewServer(cfg.shards)
+	// Single-node execution model (no shard fan-out)
+	srv := flightsql.NewServer()
 
 	grpcServer := grpc.NewServer(
 		grpc.MaxRecvMsgSize(cfg.maxRecvBytes()),
@@ -48,7 +48,6 @@ func main() {
 		grpc.Creds(insecure.NewCredentials()),
 	)
 
-	// IMPORTANT: register against gen/flight server interface
 	flight.RegisterFlightServiceServer(grpcServer, srv)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -64,9 +63,6 @@ func main() {
 		}
 	}()
 
-	// ─────────────────────────────────────────────────────────────
-	// FAILURE PATH (SERVER DIED EARLY)
-	// ─────────────────────────────────────────────────────────────
 	select {
 	case err := <-serveErr:
 		log.Error("grpc server failed", "err", err)
@@ -76,9 +72,6 @@ func main() {
 		log.Info("shutdown signal received")
 	}
 
-	// ─────────────────────────────────────────────────────────────
-	// GRACEFUL SHUTDOWN
-	// ─────────────────────────────────────────────────────────────
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
@@ -87,10 +80,8 @@ func main() {
 	go func() {
 		defer close(done)
 
-		// stop accepting new RPCs
 		grpcServer.GracefulStop()
 
-		// allow server-level cleanup hooks (if implemented later)
 		if s, ok := any(srv).(interface {
 			Shutdown(context.Context) error
 		}); ok {
@@ -116,7 +107,6 @@ func main() {
 
 type config struct {
 	addr      string
-	shards    int
 	maxRecvMB int
 	maxSendMB int
 }
@@ -124,7 +114,6 @@ type config struct {
 func loadConfig() config {
 	return config{
 		addr:      getEnv("FLIGHT_ADDR", ":50051"),
-		shards:    getEnvInt("FLIGHT_SHARDS", 4),
 		maxRecvMB: getEnvInt("GRPC_MAX_RECV_MB", 64),
 		maxSendMB: getEnvInt("GRPC_MAX_SEND_MB", 64),
 	}
