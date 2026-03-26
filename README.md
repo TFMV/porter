@@ -1,4 +1,4 @@
-```markdown
+
 <div align="center">
   <img src="assets/porter-logo.svg" alt="Porter Logo" width="150" height="150">
   
