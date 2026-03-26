@@ -1,17 +1,16 @@
-```markdown
 <div align="center">
   <img src="assets/porter-logo.svg" alt="Porter Logo" width="150" height="150">
   
 # 🦆 FlightSQL Server (Arrow + ADBC + DuckDB vibes)
 
-Am expermintal, slightly opinionated, mostly serious, occasionally chaotic **Apache Arrow FlightSQL server** built on:
+An experimental, slightly opinionated, mostly serious, occasionally chaotic **Apache Arrow FlightSQL server** built on:
 
 * 🏹 Apache Arrow Flight (`arrow-go/v18`)
 * 🔌 ADBC (Arrow Database Connectivity)
 * 🦆 DuckDB (in-memory, because disks are for people who trust persistence)
 * 🧵 gRPC streaming everywhere
 
-This server speaks **Flight natively**, thinks in **Arrow batches**, and occasionally pretends it is a distributed system.
+This server speaks **Flight natively**, thinks in **Arrow batches**, and behaves like a system that respects data more than architecture fashion.
 
 ---
 
@@ -21,58 +20,11 @@ Let’s be honest:
 
 This is a **correct streaming SQL execution engine scaffold**.
 
-Not a full distributed database. Not yet.
+Not a distributed database. Not a query engine platform.
+
 More like:
 
-> “DuckDB wearing a Flight helmet and running through a fog machine labeled *sharding*”
-
----
-
-# ⚠️ Sharding Reality Check (Read before you scale it to the moon)
-
-Yes, there is a `shards` setting.
-
-No, it does not partition data.
-
-### 🧨 Current behavior:
-
-Every shard:
-
-* runs the **same SQL**
-* hits the **same DuckDB instance type**
-* returns the **same logical dataset**
-* only differs by metadata (`Shard`, `QueryID`)
-
-### Why this exists
-
-Because real distributed execution is hard, and this version:
-
-* used to attempt real sharding
-* broke in interesting and painful ways
-* was rolled back to something stable and observable
-
-### So what is it good for?
-
-* concurrency testing
-* fan-out simulation
-* load testing Flight streams
-* pretending you have a distributed system at 2am
-
----
-
-# 🧾 Core Idea
-
-Everything revolves around a single struct:
-
-```json
-ExecTicket
-```
-
-It tells the server:
-
-* what to run (`sql` or `prepared`)
-* which shard you are pretending to be
-* how many siblings exist in the hallucinated cluster
+> “DuckDB wearing a Flight helmet and taking itself very seriously in a streaming context”
 
 ---
 
@@ -83,8 +35,8 @@ It tells the server:
 A polite but firm handshake.
 
 * streaming auth
-* echo-style token validation
-* immediately rejects empty souls (and payloads)
+* token echo validation
+* immediate rejection of empty payloads
 
 Think:
 
@@ -94,31 +46,37 @@ Think:
 
 ## 2. GetSchema
 
-Runs the query just enough to figure out:
-
-> “what kind of data are we even talking about?”
+Runs the query just enough to determine shape.
 
 Returns:
 
 * Arrow IPC-encoded schema
-* no drama
-* no opinion
+* no opinions
+* no embellishment
+
+It answers one question only:
+
+> “What am I about to stream?”
 
 ---
 
 ## 3. GetFlightInfo
 
-This is where the illusion of scale begins.
+The planning stage.
 
 * executes query once
 * extracts schema
-* generates `N` endpoints
+* builds flight endpoints for execution
 
 Each endpoint contains:
 
-* same SQL
-* same result universe
-* different shard label (for vibes)
+* SQL (resolved or prepared)
+* execution metadata (`QueryID`, `execution context`)
+* a ticket for retrieval
+
+No fan-out illusion. No distributed theater.
+
+Just a clean execution contract.
 
 ---
 
@@ -149,27 +107,29 @@ Flow:
 
 ## 5. DoExchange 🌪️
 
-This is where things get *artistically parallel*.
+This is the experimental streaming channel.
 
-For each request:
+It exists for systems that want bidirectional data flow.
 
-* spawn `shards` goroutines
-* each runs the **same query**
-* all streams back into one Flight pipe
+Behavior:
+
+* receives Arrow payloads
+* executes query contextually
+* streams results back over the same channel
 
 ### Important truth
 
 This is NOT:
 
-* ❌ partitioning
-* ❌ distributed execution
-* ❌ a real shuffle engine
+* ❌ partitioned execution
+* ❌ distributed compute
+* ❌ parallel query fan-out
 
 This IS:
 
-* ✔ concurrency stress test
-* ✔ connection pool chaos test
-* ✔ “what if everything ran at once” simulator
+* ✔ streaming stress test
+* ✔ backpressure exploration
+* ✔ “what happens if everything is async” simulator
 
 ---
 
@@ -185,12 +145,12 @@ Control plane for mildly dangerous behavior.
 * stores it in memory
 * returns a prepared ID
 
-It is fast. It is ephemeral. It is gone on restart.
+Ephemeral by design.
 
 #### ClosePreparedStatement
 
 * deletes stored SQL
-* restores emotional balance
+* restores system calm
 
 ---
 
@@ -204,23 +164,22 @@ sync.Map
 
 Which is Go’s way of saying:
 
-> “We promise it’s concurrent. Don’t ask further questions.”
+> “Concurrent, unstructured, and emotionally confident.”
 
 ---
 
-# 🧵 Connection Pool
+# 🧵 Connection Model
 
-A very honest pool:
+A deliberately simple ADBC model:
 
-* in-memory DuckDB
-* lazy connection creation
-* LIFO reuse
-* no eviction policy
-* no lifecycle drama
+* in-memory DuckDB connections
+* lazy creation
+* reused when available
+* no lifecycle ceremony
 
-If it breaks:
+If something goes wrong:
 
-> it was probably the query’s fault
+> it was probably the query, not the pool
 
 ---
 
@@ -237,102 +196,97 @@ ipc.NewWriter(...WithSchema)
 Meaning:
 
 * schema becomes portable binary truth
-* clients stay happy
-* nobody argues about types
+* clients stay type-safe
+* nobody argues about structure
 
 ---
 
 ## Records
 
-Each row group:
+Each batch:
 
 * streamed as Arrow IPC
 * schema-bound
-* written one batch at a time
+* emitted incrementally
 
-No JSON. No betrayal.
+No JSON. No reinterpretation layers.
 
 ---
 
 # ⚙️ Concurrency Model
 
-* DoGet: single-stream disciplined execution
-* DoExchange: goroutine chaos engine
-* pool: mutex-protected optimism
-* no distributed coordinator (yet)
+* DoGet: disciplined single-stream execution
+* DoExchange: experimental bidirectional streaming
+* connection pool: mutex-protected optimism
+* no distributed execution layer
 
 ---
 
-# 💥 Known Limitations (a.k.a. “features in disguise”)
+# 💥 Known Limitations (a.k.a. “honest boundaries”)
 
-### 🧩 Sharding is fake
+### 🧠 No query planner control
 
-Every shard runs identical SQL.
+DuckDB handles optimization internally.
 
-### 🧠 No query planner
+### 🔁 No result merging layer
 
-DuckDB is doing the thinking. We are just passing it notes.
-
-### 🔁 No result merge
-
-DoExchange just streams everything into one pipe like a confused firehose.
+Streaming is linear and direct.
 
 ### 🧊 Prepared statements are in-memory only
 
-Restart = amnesia.
+Restart = reset.
 
-### 🦆 DuckDB is in-memory only
+### 🦆 DuckDB is ephemeral
 
-Because persistence is a commitment.
+Because persistence adds narrative complexity.
 
 ---
 
 # 🧭 Design Philosophy
 
-This project sits in a very specific mental state:
+This system is built on a simple belief:
 
-> “What if Arrow Flight was easy to reason about, but still fast enough to scare people?”
+> “Streaming correctness beats architectural cosplay.”
 
 It prioritizes:
 
-* correctness over cleverness
-* streaming stability over distributed fantasies
-* observable behavior over theoretical scale
+* predictable execution
+* clean Arrow semantics
+* observable streaming behavior
+* minimal hidden state
 
 ---
 
-# 🚀 Future Ideas (a.k.a. “things that might hurt”)
+# 🚀 Future Ideas (a.k.a. “things that could get serious”)
 
-If this grows up, it could become:
+If this evolves, it might become:
 
-### Real sharding
+### Query routing layer
 
-* predicate pushdown
-* partition-aware routing
-* actual data locality
-
-### Real distributed execution
-
-* coordinator node
-* per-shard result isolation
-* merge operators
+* predicate-aware execution paths
+* selective dataset targeting
 
 ### Persistent catalog
 
 * prepared statement registry
-* query history
-* maybe even telemetry (brace yourself)
+* query metadata tracking
+
+### Distributed execution (real this time)
+
+* actual partitioned datasets
+* merge operators over Arrow streams
+* coordination layer with intent
 
 ---
 
 # 🦆 Closing Thought
 
-This system is not pretending to be perfect.
+This system is not pretending to be a distributed database.
 
-It is pretending to be:
+It is something more honest:
 
-> *a DuckDB that briefly believed it was a distributed system*
+> a streaming SQL engine that knows exactly what it is, and refuses to hallucinate architecture it doesn’t actually implement
 
-And honestly?
+And that restraint?
 
-It’s doing a pretty good job of it.
+That’s where correctness starts.
