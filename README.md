@@ -62,13 +62,19 @@ Porter implements the core Flight SQL specification:
 
 ## 🚀 Quick Start
 
-1.  **Start the Server**:
+1. **Install DuckDB ADBC Driver**:
+
+    ```bash
+    ./install_duckdb.sh
+    ```
+
+2.  **Start the Server**:
 
     ```bash
     go run ./cmd/server
     ```
 
-2.  **Run the Client**:
+3.  **Run the Client**:
 
     In a separate terminal, execute a query through the client.
 
