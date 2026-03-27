@@ -288,6 +288,150 @@ func (s *Server) GetFlightInfo(ctx context.Context, desc *flight.FlightDescripto
 
 //
 // ─────────────────────────────────────────────
+// DO EXCHANGE (FULL DUPLEX EXECUTION)
+// ─────────────────────────────────────────────
+//
+
+func (s *Server) DoExchange(stream flight.FlightService_DoExchangeServer) error {
+	ctx := stream.Context()
+
+	// =================================================
+	// 1. FIRST MESSAGE = TICKET (DataHeader ONLY)
+	// =================================================
+	first, err := stream.Recv()
+	if err != nil {
+		if errors.Is(err, io.EOF) {
+			return nil
+		}
+		return status.Errorf(codes.Internal, "recv failed: %v", err)
+	}
+
+	if len(first.DataHeader) == 0 {
+		return status.Error(codes.InvalidArgument, "missing ticket in DataHeader")
+	}
+
+	ticket, err := decodeTicket(first.DataHeader)
+	if err != nil {
+		return status.Errorf(codes.InvalidArgument, "invalid ticket: %v", err)
+	}
+
+	sql, err := s.resolveSQL(ticket)
+	if err != nil {
+		return err
+	}
+
+	// =================================================
+	// 2. PARAM STREAM (optional Arrow IPC records)
+	// =================================================
+	var lastParam arrow.Record
+
+	for {
+		if err := ctx.Err(); err != nil {
+			return status.Error(codes.Canceled, err.Error())
+		}
+
+		msg, err := stream.Recv()
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				break
+			}
+			return status.Errorf(codes.Internal, "recv failed: %v", err)
+		}
+
+		if len(msg.DataBody) == 0 {
+			continue
+		}
+
+		rdr, err := ipc.NewReader(bytes.NewReader(msg.DataBody),
+			ipc.WithAllocator(s.allocator),
+		)
+		if err != nil {
+			return status.Errorf(codes.Internal, "ipc decode failed: %v", err)
+		}
+
+		for rdr.Next() {
+			rec := rdr.Record()
+			rec.Retain()
+
+			if lastParam != nil {
+				lastParam.Release()
+			}
+			lastParam = rec
+		}
+
+		rdr.Release()
+	}
+
+	_ = lastParam // (wire this into execution later if needed)
+
+	// =================================================
+	// 3. EXECUTE QUERY
+	// =================================================
+	conn, err := s.pool.get(ctx)
+	if err != nil {
+		return err
+	}
+	defer s.pool.put(conn)
+
+	stmt, err := conn.NewStatement()
+	if err != nil {
+		return err
+	}
+	defer stmt.Close()
+
+	if err := stmt.SetSqlQuery(sql); err != nil {
+		return err
+	}
+
+	reader, _, err := stmt.ExecuteQuery(ctx)
+	if err != nil {
+		return err
+	}
+	defer reader.Release()
+
+	// =================================================
+	// 4. STREAM RESPONSE AS SINGLE IPC STREAM
+	//    (schema + all batches in ONE writer)
+	// =================================================
+	var buf bytes.Buffer
+
+	w := ipc.NewWriter(&buf,
+		ipc.WithSchema(reader.Schema()),
+		ipc.WithAllocator(s.allocator),
+	)
+	defer w.Close()
+
+	// write all batches continuously
+	for reader.Next() {
+		if err := ctx.Err(); err != nil {
+			return status.Error(codes.Canceled, err.Error())
+		}
+
+		rec := reader.Record()
+
+		if err := w.Write(rec); err != nil {
+			return status.Errorf(codes.Internal, "ipc write failed: %v", err)
+		}
+	}
+
+	if err := reader.Err(); err != nil {
+		return err
+	}
+
+	if err := w.Close(); err != nil {
+		return status.Errorf(codes.Internal, "ipc finalize failed: %v", err)
+	}
+
+	// =================================================
+	// 5. SEND ONCE (clean Flight semantics)
+	// =================================================
+	return stream.Send(&flight.FlightData{
+		DataBody: buf.Bytes(),
+	})
+}
+
+//
+// ─────────────────────────────────────────────
 // DO GET (SINGLE STREAM EXECUTION)
 // ─────────────────────────────────────────────
 //

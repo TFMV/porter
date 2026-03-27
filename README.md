@@ -1,292 +1,81 @@
 <div align="center">
-  <img src="assets/porter-logo.svg" alt="Porter Logo" width="150" height="150">
-  
-# 🦆 FlightSQL Server (Arrow + ADBC + DuckDB vibes)
-
-An experimental, slightly opinionated, mostly serious, occasionally chaotic **Apache Arrow FlightSQL server** built on:
-
-* 🏹 Apache Arrow Flight (`arrow-go/v18`)
-* 🔌 ADBC (Arrow Database Connectivity)
-* 🦆 DuckDB (in-memory, because disks are for people who trust persistence)
-* 🧵 gRPC streaming everywhere
-
-This server speaks **Flight natively**, thinks in **Arrow batches**, and behaves like a system that respects data more than architecture fashion.
+  <img src="assets/porter-logo.svg" alt="Porter Logo" width="140" height="140">
+  <h1>Porter</h1>
+  <p>A minimal, streaming-first Apache Arrow Flight SQL server built with Go, ADBC, and DuckDB.</p>
+</div>
 
 ---
 
-# 🧠 What this actually is
+## 🧠 What It Is
 
-Let’s be honest:
+Porter is a lightweight Flight SQL server designed for one job: **executing SQL against DuckDB and streaming the results as Arrow batches.**
 
-This is a **correct streaming SQL execution engine scaffold**.
+It's not a distributed database or a complex query platform. It's a clean, correct, and streaming-native SQL execution layer.
 
-Not a distributed database. Not a query engine platform.
+## 🏗️ Architecture
 
-More like:
+The server follows a simple, linear flow: client requests come through gRPC, are handled by the Flight SQL layer, and executed against an in-memory DuckDB instance via an ADBC driver.
 
-> “DuckDB wearing a Flight helmet and taking itself very seriously in a streaming context”
-
----
-
-# 🚪 Entry Points (Flight API)
-
-## 1. Handshake
-
-A polite but firm handshake.
-
-* streaming auth
-* token echo validation
-* immediate rejection of empty payloads
-
-Think:
-
-> “Hello. Yes. You may pass. But behave.”
-
----
-
-## 2. GetSchema
-
-Runs the query just enough to determine shape.
-
-Returns:
-
-* Arrow IPC-encoded schema
-* no opinions
-* no embellishment
-
-It answers one question only:
-
-> “What am I about to stream?”
-
----
-
-## 3. GetFlightInfo
-
-The planning stage.
-
-* executes query once
-* extracts schema
-* builds flight endpoints for execution
-
-Each endpoint contains:
-
-* SQL (resolved or prepared)
-* execution metadata (`QueryID`, `execution context`)
-* a ticket for retrieval
-
-No fan-out illusion. No distributed theater.
-
-Just a clean execution contract.
-
----
-
-## 4. DoGet 🧨 (The main event)
-
-This is the actual data pipeline.
-
-Flow:
-
-1. decode ticket
-2. resolve SQL (raw or prepared)
-3. open DuckDB connection via ADBC
-4. execute query
-5. stream Arrow RecordBatches
-
-### Streaming guarantees
-
-* batch-by-batch delivery
-* schema-preserving writer
-* context-aware cancellation
-* no silent stream corruption (we try)
-
-### Philosophy
-
-> “If data exists, it will be streamed. If it doesn’t, we will still behave professionally.”
-
----
-
-## 5. DoExchange 🌪️
-
-This is the experimental streaming channel.
-
-It exists for systems that want bidirectional data flow.
-
-Behavior:
-
-* receives Arrow payloads
-* executes query contextually
-* streams results back over the same channel
-
-### Important truth
-
-This is NOT:
-
-* ❌ partitioned execution
-* ❌ distributed compute
-* ❌ parallel query fan-out
-
-This IS:
-
-* ✔ streaming stress test
-* ✔ backpressure exploration
-* ✔ “what happens if everything is async” simulator
-
----
-
-## 6. DoAction 🛠️
-
-Control plane for mildly dangerous behavior.
-
-### Supported actions:
-
-#### CreatePreparedStatement
-
-* hashes SQL
-* stores it in memory
-* returns a prepared ID
-
-Ephemeral by design.
-
-#### ClosePreparedStatement
-
-* deletes stored SQL
-* restores system calm
-
----
-
-# 🦆 Prepared Statements
-
-Stored in:
-
-```go
-sync.Map
+```
+        [ Client ]
+            |
+     (gRPC / FlightSQL)
+            |
++-------------------------------+
+|     Porter Flight Server      |
++-------------------------------+
+|  Flight Endpoints             |
+|  - GetFlightInfo              |
+|  - DoGet                      |
+|  - DoPut / DoExchange         |
+|                               |
+|  Prepared Statement Cache     |
+|  - in-memory (sync.Map)       |
+|                               |
+|  ADBC Connection Layer        |
+|  - DuckDB connection reuse    |
++-------------------------------+
+            |
+         (ADBC)
+            |
++-------------------------------+
+|        DuckDB Engine          |
+|      (in-memory SQL)          |
++-------------------------------+
 ```
 
-Which is Go’s way of saying:
+### Core Components
 
-> “Concurrent, unstructured, and emotionally confident.”
+*   **Connection Pool (`connPool`)**: Manages a lightweight pool of reusable DuckDB connections via the ADBC driver.
+*   **Prepared Statement Cache (`sync.Map`)**: Stores prepared statement queries in a concurrent-safe map. These are ephemeral and reset on server restart.
 
----
+## ✈️ Flight SQL Endpoints
 
-# 🧵 Connection Model
+Porter implements the core Flight SQL specification:
 
-A deliberately simple ADBC model:
+*   `Handshake`: A simple auth mechanism to start a session.
+*   `GetSchema`: Returns the Arrow `Schema` for a SQL query without executing it.
+*   `GetFlightInfo`: "Plans" a query by creating a ticket that can be used with `DoGet`.
+*   `DoGet`: Executes a ticket's query and streams the `RecordBatch` results.
+*   `DoAction`: Handles control-plane tasks like creating and closing prepared statements.
+*   `DoPut`: Executes a prepared statement, receiving bound parameters as an Arrow `RecordBatch` stream.
 
-* in-memory DuckDB connections
-* lazy creation
-* reused when available
-* no lifecycle ceremony
+## 🚀 Quick Start
 
-If something goes wrong:
+1.  **Start the Server**:
 
-> it was probably the query, not the pool
+    ```bash
+    go run ./cmd/server
+    ```
 
----
+2.  **Run the Client**:
 
-# 📦 Arrow Integration
+    In a separate terminal, execute a query through the client.
 
-## Schema
+    ```bash
+    go run ./cmd/client
+    ```
 
-Serialized via:
+## 💡 Philosophy
 
-```go
-ipc.NewWriter(...WithSchema)
-```
-
-Meaning:
-
-* schema becomes portable binary truth
-* clients stay type-safe
-* nobody argues about structure
-
----
-
-## Records
-
-Each batch:
-
-* streamed as Arrow IPC
-* schema-bound
-* emitted incrementally
-
-No JSON. No reinterpretation layers.
-
----
-
-# ⚙️ Concurrency Model
-
-* DoGet: disciplined single-stream execution
-* DoExchange: experimental bidirectional streaming
-* connection pool: mutex-protected optimism
-* no distributed execution layer
-
----
-
-# 💥 Known Limitations (a.k.a. “honest boundaries”)
-
-### 🧠 No query planner control
-
-DuckDB handles optimization internally.
-
-### 🔁 No result merging layer
-
-Streaming is linear and direct.
-
-### 🧊 Prepared statements are in-memory only
-
-Restart = reset.
-
-### 🦆 DuckDB is ephemeral
-
-Because persistence adds narrative complexity.
-
----
-
-# 🧭 Design Philosophy
-
-This system is built on a simple belief:
-
-> “Streaming correctness beats architectural cosplay.”
-
-It prioritizes:
-
-* predictable execution
-* clean Arrow semantics
-* observable streaming behavior
-* minimal hidden state
-
----
-
-# 🚀 Future Ideas (a.k.a. “things that could get serious”)
-
-If this evolves, it might become:
-
-### Query routing layer
-
-* predicate-aware execution paths
-* selective dataset targeting
-
-### Persistent catalog
-
-* prepared statement registry
-* query metadata tracking
-
-### Distributed execution (real this time)
-
-* actual partitioned datasets
-* merge operators over Arrow streams
-* coordination layer with intent
-
----
-
-# 🦆 Closing Thought
-
-This system is not pretending to be a distributed database.
-
-It is something more honest:
-
-> a streaming SQL engine that knows exactly what it is, and refuses to hallucinate architecture it doesn’t actually implement
-
-And that restraint?
-
-That’s where correctness starts.
+> SQL in. Arrow out. No drama.
