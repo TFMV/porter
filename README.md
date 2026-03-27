@@ -1,87 +1,165 @@
 <div align="center">
   <img src="assets/porter-logo.svg" alt="Porter Logo" width="140" height="140">
   <h1>Porter</h1>
-  <p>A minimal, streaming-first Apache Arrow Flight SQL server built with Go, ADBC, and DuckDB.</p>
+  <p>A streaming-first Arrow Flight SQL server for DuckDB — built for clarity, not ceremony.</p>
 </div>
 
 ---
 
 ## 🧠 What It Is
 
-Porter is a lightweight Flight SQL server designed for one job: **executing SQL against DuckDB and streaming the results as Arrow batches.**
+Porter does one thing well:
 
-It's not a distributed database or a complex query platform. It's a clean, correct, and streaming-native SQL execution layer.
+> **Execute SQL against DuckDB and stream Arrow record batches over Flight.**
+
+No orchestration layer. No distributed query planner. No pretending to be something bigger.
+
+Just a clean, fast path from **SQL → Arrow**.
+
+---
+
+## ⚠️ What It Is *Not*
+
+Porter is **not a generic ADBC / Flight SQL endpoint**.
+
+It intentionally avoids parts of the spec that introduce unnecessary indirection:
+
+* No protobuf-wrapped SQL commands
+* No driver-manager abstraction layer
+* No “universal” compatibility guarantees
+
+Instead, Porter speaks a **tight, explicit Flight contract**:
+
+* SQL is sent as raw bytes
+* Tickets are server-issued and opaque
+* Streams are Arrow IPC, end to end
+
+If you want full cross-driver compatibility, use a reference Flight SQL server.
+
+If you want something fast, understandable, and hackable — use Porter.
+
+---
 
 ## 🏗️ Architecture
 
-The server follows a simple, linear flow: client requests come through gRPC, are handled by the Flight SQL layer, and executed against an in-memory DuckDB instance via an ADBC driver.
+A straight line. No detours.
 
 ```
-        [ Client ]
-            |
-     (gRPC / FlightSQL)
-            |
+    [ Client ]
+        |
+ (gRPC / Flight)
+        |
 +-------------------------------+
-|     Porter Flight Server      |
+| Porter Server                 |
 +-------------------------------+
-|  Flight Endpoints             |
-|  - GetFlightInfo              |
-|  - DoGet                      |
-|  - DoPut / DoExchange         |
-|                               |
-|  Prepared Statement Cache     |
-|  - in-memory (sync.Map)       |
-|                               |
-|  ADBC Connection Layer        |
-|  - DuckDB connection reuse    |
-+-------------------------------+
-            |
-         (ADBC)
-            |
-+-------------------------------+
-|        DuckDB Engine          |
-|      (in-memory SQL)          |
+| Flight RPCs                  |
+| - GetFlightInfo (SQL → plan) |
+| - DoGet (plan → data)        |
+| - DoExchange (SQL → data)    |
+|                              |
+| Prepared Statements          |
+| - in-memory                  |
+|                              |
+| DuckDB Engine (embedded)     |
 +-------------------------------+
 ```
 
-### Core Components
+---
 
-*   **Connection Pool (`connPool`)**: Manages a lightweight pool of reusable DuckDB connections via the ADBC driver.
-*   **Prepared Statement Cache (`sync.Map`)**: Stores prepared statement queries in a concurrent-safe map. These are ephemeral and reset on server restart.
+## ✈️ Wire Contract (Important)
 
-## ✈️ Flight SQL Endpoints
+Porter uses a **simplified Flight SQL protocol**:
 
-Porter implements the core Flight SQL specification:
+| RPC             | Payload                                |
+| --------------- | -------------------------------------- |
+| `GetFlightInfo` | `FlightDescriptor.Cmd = raw SQL bytes` |
+| `GetSchema`     | `FlightDescriptor.Cmd = raw SQL bytes` |
+| `DoGet`         | `Ticket = {"plan_id": "..."}` (JSON)   |
+| `DoExchange`    | First message contains raw SQL         |
+| `DoAction`      | JSON for prepared statement lifecycle  |
 
-*   `Handshake`: A simple auth mechanism to start a session.
-*   `GetSchema`: Returns the Arrow `Schema` for a SQL query without executing it.
-*   `GetFlightInfo`: "Plans" a query by creating a ticket that can be used with `DoGet`.
-*   `DoGet`: Executes a ticket's query and streams the `RecordBatch` results.
-*   `DoAction`: Handles control-plane tasks like creating and closing prepared statements.
-*   `DoPut`: Executes a prepared statement, receiving bound parameters as an Arrow `RecordBatch` stream.
+No protobuf `CommandStatementQuery`.
+No driver translation layer.
+No surprises.
+
+---
 
 ## 🚀 Quick Start
 
-1. **Install DuckDB ADBC Driver**:
+### 1. Start the Server
 
-    ```bash
-    ./install_duckdb.sh
-    ```
+```bash
+go run ./cmd/server
+```
 
-2.  **Start the Server**:
+Default:
 
-    ```bash
-    go run ./cmd/server
-    ```
+```
+localhost:32010
+```
 
-3.  **Run the Client**:
+---
 
-    In a separate terminal, execute a query through the client.
+### 2. Run the Native Client
 
-    ```bash
-    go run ./cmd/client
-    ```
+```bash
+go run ./cmd/client
+```
 
-## 💡 Philosophy
+You should see streamed Arrow batches logged to stdout.
+
+---
+
+### 3. (Optional) Try ADBC
+
+ADBC *can* work — but only if the server speaks full Flight SQL.
+
+Porter does not.
+
+If you try anyway, you’ll hit errors like:
+
+```
+Parser Error: syntax error at or near "Ctype.googleapis.com/..."
+```
+
+That’s the driver sending protobuf-encoded commands your server intentionally ignores.
+
+---
+
+## 💡 Why This Design
+
+Because the “standard” stack looks like this:
+
+```
+SQL → protobuf → Flight SQL → driver manager → ADBC → DuckDB
+```
+
+Porter collapses it to:
+
+```
+SQL → Flight → DuckDB → Arrow
+```
+
+Fewer layers. Fewer surprises. Faster iteration.
+
+---
+
+## 🧪 Philosophy
 
 > SQL in. Arrow out. No drama.
+
+---
+
+## 🛣️ Roadmap (Honest Version)
+
+* [ ] Parameter binding via `DoPut`
+* [ ] Better session management
+* [ ] Optional strict Flight SQL compatibility layer
+* [ ] Benchmarks
+
+---
+
+## 🤝 Contributing
+
+If you’ve ever fought a “standards-compliant” data stack and thought
+“this should be simpler” — you’re in the right place.
