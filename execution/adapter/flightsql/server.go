@@ -30,6 +30,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
+	"io"
 	"sync"
 	"time"
 
@@ -40,6 +41,7 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/flight"
 	fsql "github.com/apache/arrow-go/v18/arrow/flight/flightsql"
 	pb "github.com/apache/arrow-go/v18/arrow/flight/gen/flight"
+	"github.com/apache/arrow-go/v18/arrow/ipc"
 	"github.com/apache/arrow-go/v18/arrow/memory"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -124,12 +126,23 @@ func NewServer(dbPath string) (*Server, error) {
 	return srv, nil
 }
 
+// flightServerWithExchange wraps a FlightSQL server and exposes a raw
+// Flight DoExchange implementation from the underlying adapter.
+type flightServerWithExchange struct {
+	flight.FlightServer
+	srv *Server
+}
+
+func (f *flightServerWithExchange) DoExchange(stream flight.FlightService_DoExchangeServer) error {
+	return f.srv.DoExchange(stream.Context(), stream)
+}
+
 // AsFlightServer wraps this server with the fsql routing layer for gRPC
 // registration:
 //
 //	flight.RegisterFlightServiceServer(grpcSrv, srv.AsFlightServer())
 func (s *Server) AsFlightServer() flight.FlightServer {
-	return fsql.NewFlightServer(s)
+	return &flightServerWithExchange{FlightServer: fsql.NewFlightServer(s), srv: s}
 }
 
 // Close stops the GC goroutine, releases all retained parameter batches, and
@@ -697,4 +710,160 @@ func (s *Server) DoPutCommandStatementUpdate(
 		return 0, err
 	}
 	return stmt.ExecuteUpdate(ctx)
+}
+
+type flightDataStreamReader struct {
+	first  *flight.FlightData
+	stream flight.FlightService_DoExchangeServer
+}
+
+func (r *flightDataStreamReader) Recv() (*flight.FlightData, error) {
+	if r.first != nil {
+		msg := r.first
+		r.first = nil
+		return msg, nil
+	}
+	return r.stream.Recv()
+}
+
+func (s *Server) recvFlightData(ctx context.Context, stream flight.FlightService_DoExchangeServer) (*flight.FlightData, error) {
+	type result struct {
+		msg *flight.FlightData
+		err error
+	}
+
+	ch := make(chan result, 1)
+	go func() {
+		msg, err := stream.Recv()
+		ch <- result{msg: msg, err: err}
+	}()
+
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case res := <-ch:
+		return res.msg, res.err
+	}
+}
+
+func (s *Server) readFlightDataParameterBatch(firstMsg *flight.FlightData, stream flight.FlightService_DoExchangeServer) (arrow.RecordBatch, error) {
+	if firstMsg == nil || (len(firstMsg.GetDataHeader()) == 0 && len(firstMsg.GetDataBody()) == 0) {
+		return nil, nil
+	}
+
+	rdr, err := flight.NewRecordReader(&flightDataStreamReader{first: firstMsg, stream: stream}, ipc.WithAllocator(s.Alloc))
+	if err != nil {
+		return nil, err
+	}
+	defer rdr.Release()
+
+	var params arrow.RecordBatch
+	for rdr.Next() {
+		rec := rdr.RecordBatch()
+		if rec == nil {
+			continue
+		}
+
+		if params == nil {
+			rec.Retain()
+			params = rec
+		} else {
+			rec.Release()
+		}
+	}
+
+	if rdr.Err() != nil {
+		if params != nil {
+			params.Release()
+		}
+		return nil, rdr.Err()
+	}
+
+	return params, nil
+}
+
+func (s *Server) DoExchange(
+	ctx context.Context,
+	stream flight.FlightService_DoExchangeServer,
+) (err error) {
+
+	// ─────────────────────────────────────────────
+	// Step 1: Read first message (must contain SQL)
+	// ─────────────────────────────────────────────
+
+	msg, err := s.recvFlightData(ctx, stream)
+	if err != nil {
+		return status.Errorf(codes.InvalidArgument, "failed to receive initial message: %v", err)
+	}
+
+	if msg == nil || msg.GetFlightDescriptor() == nil || len(msg.GetFlightDescriptor().GetCmd()) == 0 {
+		return status.Error(codes.InvalidArgument, "missing SQL in FlightDescriptor.Cmd")
+	}
+
+	sql := string(msg.GetFlightDescriptor().GetCmd())
+
+	// ─────────────────────────────────────────────
+	// Step 2: Optional parameter batch
+	// ─────────────────────────────────────────────
+
+	var params arrow.RecordBatch
+
+	if len(msg.GetDataHeader()) > 0 || len(msg.GetDataBody()) > 0 {
+		params, err = s.readFlightDataParameterBatch(msg, stream)
+		if err != nil {
+			return err
+		}
+	} else {
+		nextMsg, err := s.recvFlightData(ctx, stream)
+		if err == nil {
+			if len(nextMsg.GetDataHeader()) > 0 || len(nextMsg.GetDataBody()) > 0 {
+				params, err = s.readFlightDataParameterBatch(nextMsg, stream)
+				if err != nil {
+					return err
+				}
+			}
+		} else if err != io.EOF {
+			return status.Errorf(codes.InvalidArgument, "failed to receive optional parameter batch: %v", err)
+		}
+	}
+
+	// ─────────────────────────────────────────────
+	// Step 3: Execute using existing engine
+	// ─────────────────────────────────────────────
+
+	var (
+		schema *arrow.Schema
+		ch     <-chan flight.StreamChunk
+	)
+
+	if params != nil {
+		schema, ch, err = s.startStreamWithParams(ctx, sql, params)
+	} else {
+		schema, ch, err = s.startStream(ctx, sql)
+	}
+
+	if err != nil {
+		return err
+	}
+
+	writer := flight.NewRecordWriter(stream, ipc.WithSchema(schema), ipc.WithAllocator(s.Alloc))
+	defer func() {
+		if cerr := writer.Close(); err == nil {
+			err = cerr
+		}
+	}()
+
+	for chunk := range ch {
+		if chunk.Err != nil {
+			return chunk.Err
+		}
+
+		if err := writer.Write(chunk.Data); err != nil {
+			chunk.Data.Release()
+			return err
+		}
+		chunk.Data.Release()
+	}
+
+	return nil
 }
