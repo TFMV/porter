@@ -31,56 +31,58 @@ import (
 const schemaDerivationTimeout = 30 * time.Second
 
 // ─────────────────────────────────────────────
-// SQL EXTRACTION (KEY FIX)
+// REQUEST DECODING
 // ─────────────────────────────────────────────
 
-func extractSQL(desc *flight.FlightDescriptor) (string, error) {
-	if desc == nil || len(desc.Cmd) == 0 {
-		return "", status.Error(codes.InvalidArgument, "missing command")
-	}
+type QueryRequest interface {
+	SQL() (string, error)
+}
 
-	// ─────────────────────────────────────────────
-	// Try Flight SQL protobuf decode (ADBC path)
-	// ─────────────────────────────────────────────
-	cmd := &pb.CommandStatementQuery{}
-	var anyMsg anypb.Any
+type RawSQL []byte
 
-	// ADBC/FlightSQL commonly wraps commands in google.protobuf.Any.
-	if err := proto.Unmarshal(desc.Cmd, &anyMsg); err == nil {
-		if err := anyMsg.UnmarshalTo(cmd); err == nil {
-			sql := strings.TrimSpace(cmd.GetQuery())
-			if sql == "" {
-				return "", status.Error(codes.InvalidArgument, "empty SQL in Flight SQL command")
-			}
-			return sql, nil
-		}
-	}
-
-	// Some clients may send CommandStatementQuery bytes directly.
-	if err := proto.Unmarshal(desc.Cmd, cmd); err == nil {
-		sql := strings.TrimSpace(cmd.GetQuery())
-		if sql == "" {
-			return "", status.Error(codes.InvalidArgument, "empty SQL in Flight SQL command")
-		}
-		return sql, nil
-	}
-
-	// ─────────────────────────────────────────────
-	// Fallback: raw SQL (native Porter path)
-	// ─────────────────────────────────────────────
-	sql := strings.TrimSpace(string(desc.Cmd))
-
-	// guard against protobuf Any payload misinterpreted as SQL
-	if strings.Contains(sql, "type.googleapis.com/") {
-		return "", status.Error(codes.InvalidArgument,
-			"received protobuf Flight SQL command but failed to decode")
-	}
-
+func (r RawSQL) SQL() (string, error) {
+	sql := strings.TrimSpace(string(r))
 	if sql == "" {
 		return "", status.Error(codes.InvalidArgument, "empty SQL")
 	}
-
 	return sql, nil
+}
+
+type FlightSQLCommand struct {
+	Cmd *pb.CommandStatementQuery
+}
+
+func (f FlightSQLCommand) SQL() (string, error) {
+	if f.Cmd == nil {
+		return "", status.Error(codes.InvalidArgument, "missing Flight SQL command")
+	}
+	sql := strings.TrimSpace(f.Cmd.GetQuery())
+	if sql == "" {
+		return "", status.Error(codes.InvalidArgument, "empty SQL in Flight SQL command")
+	}
+	return sql, nil
+}
+
+func decodeRequest(desc *flight.FlightDescriptor) (QueryRequest, error) {
+	if desc == nil || len(desc.Cmd) == 0 {
+		return nil, status.Error(codes.InvalidArgument, "missing command")
+	}
+
+	var anyMsg anypb.Any
+	if err := proto.Unmarshal(desc.Cmd, &anyMsg); err == nil {
+		var cmd pb.CommandStatementQuery
+		if err := anyMsg.UnmarshalTo(&cmd); err == nil {
+			return FlightSQLCommand{Cmd: &cmd}, nil
+		}
+	}
+
+	// Compatibility path for clients that send command bytes directly.
+	var cmd pb.CommandStatementQuery
+	if err := proto.Unmarshal(desc.Cmd, &cmd); err == nil && strings.TrimSpace(cmd.GetQuery()) != "" {
+		return FlightSQLCommand{Cmd: &cmd}, nil
+	}
+
+	return RawSQL(desc.Cmd), nil
 }
 
 // ─────────────────────────────────────────────
@@ -386,7 +388,11 @@ func extractClosePreparedPlanID(body []byte) (string, error) {
 // ─────────────────────────────────────────────
 
 func (s *Server) GetFlightInfo(ctx context.Context, desc *flight.FlightDescriptor) (*flight.FlightInfo, error) {
-	sql, err := extractSQL(desc)
+	req, err := decodeRequest(desc)
+	if err != nil {
+		return nil, err
+	}
+	sql, err := req.SQL()
 	if err != nil {
 		return nil, err
 	}
@@ -407,7 +413,11 @@ func (s *Server) GetFlightInfo(ctx context.Context, desc *flight.FlightDescripto
 }
 
 func (s *Server) GetSchema(ctx context.Context, desc *flight.FlightDescriptor) (*flight.SchemaResult, error) {
-	sql, err := extractSQL(desc)
+	req, err := decodeRequest(desc)
+	if err != nil {
+		return nil, err
+	}
+	sql, err := req.SQL()
 	if err != nil {
 		return nil, err
 	}
@@ -453,7 +463,11 @@ func (s *Server) DoExchange(stream flight.FlightService_DoExchangeServer) error 
 		return err
 	}
 
-	sql, err := extractSQL(first.FlightDescriptor)
+	req, err := decodeRequest(first.FlightDescriptor)
+	if err != nil {
+		return err
+	}
+	sql, err := req.SQL()
 	if err != nil {
 		return err
 	}
