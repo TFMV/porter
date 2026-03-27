@@ -99,19 +99,24 @@ type Server struct {
 	stopGC chan struct{}
 }
 
+type Config struct {
+	DBPath string
+	Port   int
+}
+
 // NewServer opens a DuckDB database at dbPath ("" or ":memory:" for in-memory)
 // and starts a background goroutine that evicts expired handles.
-func NewServer(dbPath string) (*Server, error) {
-	if dbPath == "" {
-		dbPath = ":memory:"
+func NewServer(cfg Config) (*Server, error) {
+	if cfg.DBPath == "" {
+		cfg.DBPath = ":memory:"
 	}
 	drv := drivermgr.Driver{}
 	db, err := drv.NewDatabase(map[string]string{
 		"driver": "duckdb",
-		"path":   dbPath,
+		"path":   cfg.DBPath,
 	})
 	if err != nil {
-		return nil, fmt.Errorf("open duckdb %q: %w", dbPath, err)
+		return nil, fmt.Errorf("open duckdb %q: %w", cfg.DBPath, err)
 	}
 
 	srv := &Server{
@@ -782,50 +787,58 @@ func (s *Server) readFlightDataParameterBatch(firstMsg *flight.FlightData, strea
 func (s *Server) DoExchange(
 	ctx context.Context,
 	stream flight.FlightService_DoExchangeServer,
-) (err error) {
+) error {
 
 	// ─────────────────────────────────────────────
-	// Step 1: Read first message (must contain SQL)
+	// Step 1: Read first message
 	// ─────────────────────────────────────────────
 
-	msg, err := s.recvFlightData(ctx, stream)
+	msg, err := stream.Recv()
 	if err != nil {
-		return status.Errorf(codes.InvalidArgument, "failed to receive initial message: %v", err)
+		return status.Errorf(codes.InvalidArgument, "recv first message: %v", err)
 	}
-
-	if msg == nil || msg.GetFlightDescriptor() == nil || len(msg.GetFlightDescriptor().GetCmd()) == 0 {
-		return status.Error(codes.InvalidArgument, "missing SQL in FlightDescriptor.Cmd")
+	if msg == nil || msg.GetFlightDescriptor() == nil {
+		return status.Error(codes.InvalidArgument, "missing FlightDescriptor")
 	}
 
 	sql := string(msg.GetFlightDescriptor().GetCmd())
+	if sql == "" {
+		return status.Error(codes.InvalidArgument, "empty SQL command")
+	}
 
 	// ─────────────────────────────────────────────
-	// Step 2: Optional parameter batch
+	// Step 2: Read optional parameter batch (strict)
 	// ─────────────────────────────────────────────
 
 	var params arrow.RecordBatch
 
-	if len(msg.GetDataHeader()) > 0 || len(msg.GetDataBody()) > 0 {
+	hasInlineParams := len(msg.GetDataHeader()) > 0 || len(msg.GetDataBody()) > 0
+
+	if hasInlineParams {
 		params, err = s.readFlightDataParameterBatch(msg, stream)
 		if err != nil {
-			return err
+			return status.Errorf(codes.InvalidArgument, "read params: %v", err)
 		}
 	} else {
-		nextMsg, err := s.recvFlightData(ctx, stream)
-		if err == nil {
-			if len(nextMsg.GetDataHeader()) > 0 || len(nextMsg.GetDataBody()) > 0 {
-				params, err = s.readFlightDataParameterBatch(nextMsg, stream)
+		next, err := stream.Recv()
+
+		switch {
+		case err == io.EOF:
+			// no params, valid
+		case err != nil:
+			return status.Errorf(codes.InvalidArgument, "recv param batch: %v", err)
+		default:
+			if len(next.GetDataHeader()) > 0 || len(next.GetDataBody()) > 0 {
+				params, err = s.readFlightDataParameterBatch(next, stream)
 				if err != nil {
 					return err
 				}
 			}
-		} else if err != io.EOF {
-			return status.Errorf(codes.InvalidArgument, "failed to receive optional parameter batch: %v", err)
 		}
 	}
 
 	// ─────────────────────────────────────────────
-	// Step 3: Execute using existing engine
+	// Step 3: Execute
 	// ─────────────────────────────────────────────
 
 	var (
@@ -838,17 +851,11 @@ func (s *Server) DoExchange(
 	} else {
 		schema, ch, err = s.startStream(ctx, sql)
 	}
-
 	if err != nil {
 		return err
 	}
 
 	writer := flight.NewRecordWriter(stream, ipc.WithSchema(schema), ipc.WithAllocator(s.Alloc))
-	defer func() {
-		if cerr := writer.Close(); err == nil {
-			err = cerr
-		}
-	}()
 
 	for chunk := range ch {
 		if chunk.Err != nil {
@@ -860,7 +867,12 @@ func (s *Server) DoExchange(
 			return err
 		}
 		chunk.Data.Release()
+
+		// respect cancellation explicitly
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
 	}
 
-	return nil
+	return writer.Close()
 }

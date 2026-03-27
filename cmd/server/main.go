@@ -33,7 +33,12 @@ func main() {
 	grpcSrv := grpc.NewServer()
 	reflection.Register(grpcSrv)
 
-	s, err := flightsql.NewServer(dbPath)
+	cfg := flightsql.Config{
+		DBPath: dbPath,
+		Port:   32010,
+	}
+
+	s, err := flightsql.NewServer(cfg)
 	if err != nil {
 		log.Fatalf("init server: %v", err)
 	}
