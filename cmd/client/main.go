@@ -15,6 +15,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -494,33 +495,38 @@ func (c *FlightSQLClient) Exchange(ctx context.Context, sessionID string, sqls .
 		return nil, fmt.Errorf("DoExchange: open: %w", err)
 	}
 
-	// Send all queries, then close the send side.
+	// -----------------------------
+	// SEND REQUESTS
+	// -----------------------------
 	for _, sql := range sqls {
-		header, err := marshalTicket(ExecTicket{Type: TicketTypeSQL, SQL: sql})
+		header, err := marshalTicket(ExecTicket{
+			Type: TicketTypeSQL,
+			SQL:  sql,
+		})
 		if err != nil {
 			_ = stream.CloseSend()
 			return nil, err
 		}
 
-		if err := stream.Send(&flight.FlightData{DataHeader: header}); err != nil {
-			return nil, fmt.Errorf("DoExchange: send(%q): %w", sql, err)
+		if err := stream.Send(&flight.FlightData{
+			DataHeader: header,
+		}); err != nil {
+			_ = stream.CloseSend()
+			return nil, fmt.Errorf("DoExchange send: %w", err)
 		}
 	}
 
 	if err := stream.CloseSend(); err != nil {
-		return nil, fmt.Errorf("DoExchange: CloseSend: %w", err)
+		return nil, fmt.Errorf("DoExchange CloseSend: %w", err)
 	}
 
-	// Receive all response batches.  The server sends one IPC stream per query;
-	// we collect them all into a flat list of results keyed by query index.
-	//
-	// Protocol contract (matches server streamToDoExchange):
-	//   Each FlightData.DataBody carries a self-contained IPC stream
-	//   (schema + one batch + EOS).
+	// -----------------------------
+	// RECEIVE STREAMS (1:1 mapping)
+	// -----------------------------
 	var results []*QueryResult
 
 	for {
-		data, err := stream.Recv()
+		msg, err := stream.Recv()
 		if errors.Is(err, io.EOF) {
 			break
 		}
@@ -528,35 +534,40 @@ func (c *FlightSQLClient) Exchange(ctx context.Context, sessionID string, sqls .
 			for _, r := range results {
 				r.Release()
 			}
-			return nil, fmt.Errorf("DoExchange: recv: %w", err)
+			return nil, fmt.Errorf("DoExchange recv: %w", err)
 		}
 
-		if len(data.DataBody) == 0 {
+		if len(msg.DataBody) == 0 {
 			continue
 		}
 
-		batch, schema, err := decodeIPCBatch(data.DataBody, c.cfg.Allocator)
+		reader, err := ipc.NewReader(
+			bytes.NewReader(msg.DataBody),
+			ipc.WithAllocator(c.cfg.Allocator),
+		)
 		if err != nil {
-			return nil, fmt.Errorf("DoExchange: decode batch: %w", err)
+			return nil, fmt.Errorf("ipc reader: %w", err)
 		}
 
-		// Find or create the result bucket for this schema.
-		var bucket *QueryResult
-		for _, r := range results {
-			if r.Schema.Equal(schema) {
-				bucket = r
-				break
+		schema := reader.Schema()
+		result := &QueryResult{Schema: schema}
+
+		for reader.Next() {
+			rec := reader.RecordBatch()
+			rec.Retain()
+			result.Batches = append(result.Batches, rec)
+		}
+
+		if err := reader.Err(); err != nil {
+			reader.Release()
+			for _, r := range results {
+				r.Release()
 			}
+			return nil, err
 		}
 
-		if bucket == nil {
-			bucket = &QueryResult{Schema: schema}
-			results = append(results, bucket)
-		}
-
-		if batch != nil {
-			bucket.Batches = append(bucket.Batches, batch)
-		}
+		reader.Release()
+		results = append(results, result)
 	}
 
 	return results, nil
