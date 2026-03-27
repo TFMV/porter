@@ -31,6 +31,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io"
+	"log"
 	"sync"
 	"time"
 
@@ -482,9 +483,9 @@ func (s *Server) DoGetStatement(
 
 // ─── prepared statements ──────────────────────────────────────────────────────
 
-// CreatePreparedStatement stores the SQL under a random TTL-bounded handle,
-// derives the dataset schema, and returns both to the client so it can
-// introspect columns before binding parameters.
+// CreatePreparedStatement stores the SQL under a random TTL-bounded handle
+// and returns it to the client without requiring parameter binding.
+// Parameter validation happens later during execution.
 func (s *Server) CreatePreparedStatement(
 	ctx context.Context,
 	req fsql.ActionCreatePreparedStatementRequest,
@@ -493,11 +494,6 @@ func (s *Server) CreatePreparedStatement(
 	if sql == "" {
 		return fsql.ActionCreatePreparedStatementResult{},
 			status.Error(codes.InvalidArgument, "empty query")
-	}
-
-	schema, err := s.deriveSchema(ctx, sql)
-	if err != nil {
-		return fsql.ActionCreatePreparedStatementResult{}, err
 	}
 
 	handle, err := newHandle()
@@ -512,14 +508,10 @@ func (s *Server) CreatePreparedStatement(
 	}
 	s.preparedStmtsMu.Unlock()
 
-	return fsql.ActionCreatePreparedStatementResult{
-		Handle:        []byte(handle),
-		DatasetSchema: schema,
-	}, nil
+	log.Printf("CreatePreparedStatement handle=%s sql=%q", handle, sql)
+	return fsql.ActionCreatePreparedStatementResult{Handle: []byte(handle)}, nil
 }
 
-// ClosePreparedStatement removes the prepared entry and releases its parameter
-// batch (if any). Idempotent: closing an already-closed handle is a no-op.
 func (s *Server) ClosePreparedStatement(
 	_ context.Context,
 	req fsql.ActionClosePreparedStatementRequest,
@@ -533,6 +525,7 @@ func (s *Server) ClosePreparedStatement(
 	}
 	s.preparedStmtsMu.Unlock()
 
+	log.Printf("ClosePreparedStatement handle=%s closed=%t", handle, ok)
 	if ok && e.paramBatch != nil {
 		e.paramBatch.Release()
 	}
@@ -562,18 +555,13 @@ func (s *Server) GetFlightInfoPreparedStatement(
 		return nil, status.Errorf(codes.NotFound, "prepared statement not found")
 	}
 
-	schema, err := s.deriveSchema(ctx, e.sql)
-	if err != nil {
-		return nil, err
-	}
-
+	log.Printf("GetFlightInfoPreparedStatement handle=%s sql=%q", handle, e.sql)
 	ticketBytes, err := preparedStatementTicket([]byte(handle))
 	if err != nil {
 		return nil, err
 	}
 
 	return &flight.FlightInfo{
-		Schema:           flight.SerializeSchema(schema, s.Alloc),
 		FlightDescriptor: desc,
 		Endpoint:         []*flight.FlightEndpoint{{Ticket: &flight.Ticket{Ticket: ticketBytes}}},
 		TotalRecords:     -1,
@@ -597,6 +585,7 @@ func (s *Server) GetSchemaPreparedStatement(
 		return nil, status.Errorf(codes.NotFound, "prepared statement not found")
 	}
 
+	log.Printf("GetSchemaPreparedStatement handle=%s sql=%q", handle, e.sql)
 	schema, err := s.deriveSchema(ctx, e.sql)
 	if err != nil {
 		return nil, err
@@ -624,6 +613,13 @@ func (s *Server) DoPutPreparedStatementQuery(
 		rec.Retain() // our reference; released by ClosePreparedStatement / GC / next Put
 		newBatch = rec
 	}
+
+	log.Printf("DoPutPreparedStatementQuery handle=%s paramRows=%d", handle, func() int {
+		if newBatch == nil {
+			return 0
+		}
+		return int(newBatch.NumRows())
+	}())
 
 	s.preparedStmtsMu.Lock()
 	e, ok := s.preparedStmts[handle]
@@ -676,6 +672,7 @@ func (s *Server) DoGetPreparedStatement(
 		return nil, nil, status.Errorf(codes.NotFound, "prepared statement not found")
 	}
 
+	log.Printf("DoGetPreparedStatement handle=%s boundParams=%t sql=%q", handle, e.paramBatch != nil, e.sql)
 	// e.paramBatch is nil (no binding) or pre-retained; startStreamWithParams
 	// owns the reference from this point forward.
 	return s.startStreamWithParams(ctx, e.sql, e.paramBatch)
