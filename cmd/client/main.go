@@ -7,6 +7,9 @@ import (
 
 	"github.com/apache/arrow-adbc/go/adbc/drivermgr"
 	"github.com/apache/arrow-go/v18/arrow/array"
+	"github.com/apache/arrow-go/v18/arrow/flight"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
 )
 
 func main() {
@@ -174,9 +177,44 @@ func main() {
 	printStream(stream4)
 
 	// ─────────────────────────────────────────────
-	// 8. Cleanup happens via defer
+	// 9. DoExchange test
 	// ─────────────────────────────────────────────
-	fmt.Println("\n=== Done ===")
+	fmt.Println("\n=== DoExchange ===")
+
+	flightClient, err := flight.NewFlightClient("127.0.0.1:32010", nil, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		log.Fatal("NewFlightClient:", err)
+	}
+	defer flightClient.Close()
+
+	exchangeStream, err := flightClient.DoExchange(ctx)
+	if err != nil {
+		log.Fatal("DoExchange:", err)
+	}
+
+	if err := exchangeStream.Send(&flight.FlightData{
+		FlightDescriptor: &flight.FlightDescriptor{
+			Type: flight.DescriptorCMD,
+			Cmd:  []byte(`SELECT 1 AS id, 'exchange' AS name`),
+		},
+	}); err != nil {
+		log.Fatal("DoExchange send:", err)
+	}
+
+	if err := exchangeStream.CloseSend(); err != nil {
+		log.Fatal("DoExchange close send:", err)
+	}
+
+	rd, err := flight.NewRecordReader(exchangeStream)
+	if err != nil {
+		log.Fatal("DoExchange reader:", err)
+	}
+	printStream(rd)
+
+	// ─────────────────────────────────────────────
+	// 10. Cleanup happens via defer
+	// ─────────────────────────────────────────────
+	fmt.Println("=== Done ===")
 }
 
 // ─────────────────────────────────────────────
