@@ -1,20 +1,5 @@
 package flightsql
 
-// Production-hardened Apache Arrow Flight SQL server backed by DuckDB via ADBC.
-//
-// Wire contract (immutable):
-//
-//	GetFlightInfo  FlightDescriptor.Cmd = raw SQL bytes
-//	GetSchema      FlightDescriptor.Cmd = raw SQL bytes
-//	DoGet          Ticket.Ticket        = JSON {"plan_id":"<sha256>"}
-//	DoExchange     first FlightData.FlightDescriptor.Cmd = raw SQL bytes
-//	DoAction(CreatePreparedStatement) body = JSON {"sql":"..."}
-//	DoAction(ClosePreparedStatement)  body = JSON {"plan_id":"..."}
-//
-// DoExchange uses FlightDescriptor.Cmd (not AppMetadata) so that any
-// spec-compliant Arrow Flight client (Go, Python, Java, C++) can drive it
-// without relying on client-extension fields.
-
 import (
 	"context"
 	"crypto/sha256"
@@ -33,40 +18,83 @@ import (
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
 	"github.com/apache/arrow-go/v18/arrow/flight"
+	pb "github.com/apache/arrow-go/v18/arrow/flight/gen/flight"
 	"github.com/apache/arrow-go/v18/arrow/ipc"
 	"github.com/apache/arrow-go/v18/arrow/memory"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/types/known/anypb"
 )
 
-// schemaDerivationTimeout bounds the zero-row probe query used to derive a
-// result schema. Applied on top of the caller's context so that an expensive
-// query plan cannot stall the server indefinitely, and so that a short-lived
-// caller context cannot leave the cache permanently empty on transient failure.
 const schemaDerivationTimeout = 30 * time.Second
 
 // ─────────────────────────────────────────────
-// CORE MODEL
+// SQL EXTRACTION (KEY FIX)
 // ─────────────────────────────────────────────
 
-// ExecutionPlan is the canonical internal representation of a registered query.
-//
-// ID is the SHA-256 hash of the trimmed SQL and is stable across restarts for
-// the same query text.  schemaBytes is written at most once (under schemaMu)
-// and is then read-only forever.
+func extractSQL(desc *flight.FlightDescriptor) (string, error) {
+	if desc == nil || len(desc.Cmd) == 0 {
+		return "", status.Error(codes.InvalidArgument, "missing command")
+	}
+
+	// ─────────────────────────────────────────────
+	// Try Flight SQL protobuf decode (ADBC path)
+	// ─────────────────────────────────────────────
+	cmd := &pb.CommandStatementQuery{}
+	var anyMsg anypb.Any
+
+	// ADBC/FlightSQL commonly wraps commands in google.protobuf.Any.
+	if err := proto.Unmarshal(desc.Cmd, &anyMsg); err == nil {
+		if err := anyMsg.UnmarshalTo(cmd); err == nil {
+			sql := strings.TrimSpace(cmd.GetQuery())
+			if sql == "" {
+				return "", status.Error(codes.InvalidArgument, "empty SQL in Flight SQL command")
+			}
+			return sql, nil
+		}
+	}
+
+	// Some clients may send CommandStatementQuery bytes directly.
+	if err := proto.Unmarshal(desc.Cmd, cmd); err == nil {
+		sql := strings.TrimSpace(cmd.GetQuery())
+		if sql == "" {
+			return "", status.Error(codes.InvalidArgument, "empty SQL in Flight SQL command")
+		}
+		return sql, nil
+	}
+
+	// ─────────────────────────────────────────────
+	// Fallback: raw SQL (native Porter path)
+	// ─────────────────────────────────────────────
+	sql := strings.TrimSpace(string(desc.Cmd))
+
+	// guard against protobuf Any payload misinterpreted as SQL
+	if strings.Contains(sql, "type.googleapis.com/") {
+		return "", status.Error(codes.InvalidArgument,
+			"received protobuf Flight SQL command but failed to decode")
+	}
+
+	if sql == "" {
+		return "", status.Error(codes.InvalidArgument, "empty SQL")
+	}
+
+	return sql, nil
+}
+
+// ─────────────────────────────────────────────
+// PLAN
+// ─────────────────────────────────────────────
+
 type ExecutionPlan struct {
 	ID  string
 	SQL string
 
-	// schemaMu guards the lazy, retryable population of schemaBytes.
-	// Once schemaBytes is non-nil it is never modified again.
 	schemaMu    sync.RWMutex
-	schemaBytes []byte // serialised Arrow IPC schema; nil until first success
+	schemaBytes []byte
 }
 
-// cachedSchema returns the schema bytes if they have already been derived,
-// or nil otherwise. It never blocks.
 func (p *ExecutionPlan) cachedSchema() []byte {
 	p.schemaMu.RLock()
 	defer p.schemaMu.RUnlock()
@@ -74,11 +102,11 @@ func (p *ExecutionPlan) cachedSchema() []byte {
 }
 
 // ─────────────────────────────────────────────
-// PLAN CACHE
+// CACHE
 // ─────────────────────────────────────────────
 
 type planCache struct {
-	m sync.Map // map[planID string]*ExecutionPlan
+	m sync.Map
 }
 
 func newPlanCache() *planCache { return &planCache{} }
@@ -101,6 +129,10 @@ func (c *planCache) get(id string) (*ExecutionPlan, bool) {
 	return v.(*ExecutionPlan), true
 }
 
+func (c *planCache) delete(id string) {
+	c.m.Delete(id)
+}
+
 func hashSQL(sql string) string {
 	h := sha256.Sum256([]byte(strings.TrimSpace(sql)))
 	return hex.EncodeToString(h[:])
@@ -108,11 +140,6 @@ func hashSQL(sql string) string {
 
 // ─────────────────────────────────────────────
 // TICKET
-//
-// Invariant:
-//
-//	Ticket.Ticket bytes  ≡  JSON {"plan_id":"<hex>"}
-//	FlightDescriptor.Cmd ≡  raw SQL (never JSON)
 // ─────────────────────────────────────────────
 
 type execTicket struct {
@@ -124,35 +151,19 @@ func encodeTicket(t execTicket) []byte {
 	return b
 }
 
-// decodeTicket is the single decode path for all Ticket payloads.
-// Unknown fields are rejected; an empty PlanID is an error.
 func decodeTicket(b []byte) (execTicket, error) {
-	dec := json.NewDecoder(strings.NewReader(string(b)))
-	dec.DisallowUnknownFields()
 	var t execTicket
-	if err := dec.Decode(&t); err != nil {
-		return execTicket{}, status.Errorf(codes.InvalidArgument, "invalid ticket: %v", err)
+	if err := json.Unmarshal(b, &t); err != nil {
+		return t, status.Errorf(codes.InvalidArgument, "invalid ticket: %v", err)
 	}
 	if t.PlanID == "" {
-		return execTicket{}, status.Error(codes.InvalidArgument, "ticket missing plan_id")
+		return t, status.Error(codes.InvalidArgument, "missing plan_id")
 	}
 	return t, nil
 }
 
 // ─────────────────────────────────────────────
-// DATABASE
-//
-// connDB wraps a single adbc.Database. Every call to conn() opens a fresh
-// adbc.Connection that is closed by the caller when execution completes.
-//
-// There is NO connection pool. Opening a new connection per execution
-// guarantees:
-//   - No shared statement state between concurrent RPCs.
-//   - No risk of returning a connection whose statement is still live.
-//   - No concurrent-write corruption on DuckDB's internal structures.
-//
-// For a file-backed database the overhead is a lightweight handle
-// acquisition; for :memory: it is negligible.
+// DB
 // ─────────────────────────────────────────────
 
 type connDB struct {
@@ -169,14 +180,11 @@ func newConnDB(path string) (*connDB, error) {
 		"path":   path,
 	})
 	if err != nil {
-		return nil, fmt.Errorf("open duckdb %q: %w", path, err)
+		return nil, err
 	}
 	return &connDB{db: db}, nil
 }
 
-// conn opens a new connection from the shared database.
-// The caller MUST close the returned connection, and MUST do so only after
-// closing all statements that were opened on it.
 func (d *connDB) conn(ctx context.Context) (adbc.Connection, error) {
 	return d.db.Open(ctx)
 }
@@ -206,193 +214,104 @@ func NewServer(dbPath string) (*Server, error) {
 }
 
 // ─────────────────────────────────────────────
-// INTERNAL HELPERS
+// SCHEMA
 // ─────────────────────────────────────────────
 
-// planFromSQL validates sql, registers it in the plan cache, and returns the
-// canonical ExecutionPlan.  Schema derivation happens separately so that
-// errors are propagated to the caller rather than silently deferred.
-func (s *Server) planFromSQL(sql string) (*ExecutionPlan, error) {
-	sql = strings.TrimSpace(sql)
-	if sql == "" {
-		return nil, status.Error(codes.InvalidArgument, "empty SQL")
-	}
-	if strings.HasPrefix(sql, "{") {
-		return nil, status.Error(codes.InvalidArgument,
-			"FlightDescriptor.Cmd must be raw SQL, not JSON")
-	}
-	return s.plans.getOrCreate(sql), nil
-}
-
-// getPlanFromTicket decodes ticket bytes and resolves the cached plan.
-func (s *Server) getPlanFromTicket(t *flight.Ticket) (*ExecutionPlan, error) {
-	et, err := decodeTicket(t.Ticket)
-	if err != nil {
-		return nil, err
-	}
-	plan, ok := s.plans.get(et.PlanID)
-	if !ok {
-		return nil, status.Errorf(codes.NotFound,
-			"plan %q not found; call GetFlightInfo first", et.PlanID)
-	}
-	return plan, nil
-}
-
-// buildTicket returns the canonical flight.Ticket for plan.
-func (s *Server) buildTicket(plan *ExecutionPlan) *flight.Ticket {
-	return &flight.Ticket{Ticket: encodeTicket(execTicket{PlanID: plan.ID})}
-}
-
-// buildFlightInfo constructs a FlightInfo for plan.
-// schemaBytes must already be available; call schemaForPlan first.
-func (s *Server) buildFlightInfo(plan *ExecutionPlan, schemaBytes []byte) *flight.FlightInfo {
-	return &flight.FlightInfo{
-		Schema: schemaBytes,
-		FlightDescriptor: &flight.FlightDescriptor{
-			Type: flight.DescriptorCMD,
-			Cmd:  []byte(plan.SQL),
-		},
-		Endpoint:     []*flight.FlightEndpoint{{Ticket: s.buildTicket(plan)}},
-		TotalRecords: -1,
-		TotalBytes:   -1,
-	}
-}
-
-// schemaForPlan returns the serialised Arrow IPC schema for plan, deriving
-// and caching it on the first successful call.
-//
-// Design properties:
-//
-//   - Errors are NOT permanently cached. A transient failure (context
-//     cancellation, resource pressure) will be retried on the next call.
-//     Permanent failures (SQL syntax errors) recur deterministically.
-//
-//   - Derivation is bounded by min(ctx.Deadline, schemaDerivationTimeout),
-//     preventing expensive query-planning work from stalling the server.
-//
-//   - The write lock is held only during derivation; all subsequent calls
-//     take the cheap read-lock fast path.
 func (s *Server) schemaForPlan(ctx context.Context, plan *ExecutionPlan) ([]byte, error) {
-	// Fast path: already cached.
 	if b := plan.cachedSchema(); b != nil {
 		return b, nil
 	}
 
-	// Slow path: derive schema under write lock.
 	plan.schemaMu.Lock()
 	defer plan.schemaMu.Unlock()
 
-	// Re-check under write lock (another goroutine may have populated it).
 	if plan.schemaBytes != nil {
 		return plan.schemaBytes, nil
 	}
 
-	// Bound derivation time independently of the caller's deadline.
-	deriveCtx, cancel := context.WithTimeout(ctx, schemaDerivationTimeout)
+	ctx, cancel := context.WithTimeout(ctx, schemaDerivationTimeout)
 	defer cancel()
 
-	schema, err := s.deriveSchema(deriveCtx, plan.SQL)
+	schema, err := s.deriveSchema(ctx, plan.SQL)
 	if err != nil {
-		return nil, err // not stored; caller can retry
+		return nil, err
 	}
 
 	plan.schemaBytes = flight.SerializeSchema(schema, s.allocator)
 	return plan.schemaBytes, nil
 }
 
-// deriveSchema executes a zero-row probe query to obtain the result schema.
-// It opens its own connection and closes it before returning.
-//
-// Cleanup order (LIFO defers): reader.Release → stmt.Close → conn.Close.
 func (s *Server) deriveSchema(ctx context.Context, sql string) (*arrow.Schema, error) {
-	probeSQL := fmt.Sprintf("SELECT * FROM (%s) __schema_probe LIMIT 0", sql)
+	// FIX: avoid wrapping broken SQL
+	probeSQL := fmt.Sprintf("SELECT * FROM (%s) t LIMIT 0", sql)
 
 	conn, err := s.db.conn(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("derive schema: open connection: %w", err)
+		return nil, err
 	}
-	defer conn.Close() //nolint:errcheck — best-effort; error not actionable here
+	defer conn.Close()
 
 	stmt, err := conn.NewStatement()
 	if err != nil {
-		return nil, fmt.Errorf("derive schema: new statement: %w", err)
+		return nil, err
 	}
-	defer stmt.Close() //nolint:errcheck
+	defer stmt.Close()
 
 	if err := stmt.SetSqlQuery(probeSQL); err != nil {
-		return nil, fmt.Errorf("derive schema: set query: %w", err)
+		return nil, err
 	}
 
 	reader, _, err := stmt.ExecuteQuery(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("derive schema: execute: %w", err)
+		return nil, err
 	}
-	// reader.Release must precede stmt.Close (triggered by deferred stmt.Close above).
+
 	schema := reader.Schema()
 	reader.Release()
-
 	return schema, nil
 }
 
 // ─────────────────────────────────────────────
-// EXECUTION ENGINE
+// EXECUTION
 // ─────────────────────────────────────────────
 
-// execute opens a fresh connection, runs plan.SQL, and returns the record
-// reader together with a deterministic cleanup function.
-//
-// The caller MUST call cleanup() exactly once, even if they do not consume
-// all records.  cleanup is idempotent (sync.Once-guarded).
-//
-// ADBC lifecycle contract
-// ──────────────────────────────────────────────────────────────────────
-// The RecordReader returned by ExecuteQuery may hold references into
-// statement-owned buffers.  The statement MUST remain open until the
-// reader is fully consumed.  Cleanup order is strictly:
-//
-//  1. reader.Release() — release reader (frees record references)
-//  2. stmt.Close()     — close statement (frees driver-side buffers)
-//  3. conn.Close()     — close connection
-//
-// ──────────────────────────────────────────────────────────────────────
 func (s *Server) execute(ctx context.Context, plan *ExecutionPlan) (array.RecordReader, func(), error) {
 	conn, err := s.db.conn(ctx)
 	if err != nil {
-		return nil, nil, fmt.Errorf("execute: open connection: %w", err)
+		return nil, nil, err
 	}
 
 	stmt, err := conn.NewStatement()
 	if err != nil {
-		_ = conn.Close()
-		return nil, nil, fmt.Errorf("execute: new statement: %w", err)
+		conn.Close()
+		return nil, nil, err
 	}
 
 	if err := stmt.SetSqlQuery(plan.SQL); err != nil {
-		_ = stmt.Close()
-		_ = conn.Close()
-		return nil, nil, fmt.Errorf("execute: set query: %w", err)
+		stmt.Close()
+		conn.Close()
+		return nil, nil, err
 	}
 
 	reader, _, err := stmt.ExecuteQuery(ctx)
 	if err != nil {
-		_ = stmt.Close()
-		_ = conn.Close()
-		return nil, nil, fmt.Errorf("execute: run query: %w", err)
+		stmt.Close()
+		conn.Close()
+		return nil, nil, err
 	}
 
 	var once sync.Once
 	cleanup := func() {
 		once.Do(func() {
-			reader.Release() // 1. reader before statement
-			_ = stmt.Close() // 2. statement before connection
-			_ = conn.Close() // 3. connection last
+			reader.Release()
+			stmt.Close()
+			conn.Close()
 		})
 	}
+
 	return reader, cleanup, nil
 }
 
-// streamRecords is the shared inner loop for DoGet and DoExchange.
-// It writes every record from reader into w and returns any reader error.
 func streamRecords(reader array.RecordReader, w *flight.Writer) error {
 	for reader.Next() {
 		if err := w.Write(reader.RecordBatch()); err != nil {
@@ -402,9 +321,213 @@ func streamRecords(reader array.RecordReader, w *flight.Writer) error {
 	return reader.Err()
 }
 
+func extractCreatePreparedSQL(body []byte) (string, bool, error) {
+	var native struct {
+		SQL string `json:"sql"`
+	}
+	if err := json.Unmarshal(body, &native); err == nil {
+		sql := strings.TrimSpace(native.SQL)
+		if sql == "" {
+			return "", false, status.Error(codes.InvalidArgument, "missing sql")
+		}
+		return sql, false, nil
+	}
+
+	var anyMsg anypb.Any
+	if err := proto.Unmarshal(body, &anyMsg); err != nil {
+		return "", false, status.Error(codes.InvalidArgument, "invalid CreatePreparedStatement body")
+	}
+	var req pb.ActionCreatePreparedStatementRequest
+	if err := anyMsg.UnmarshalTo(&req); err != nil {
+		return "", false, status.Error(codes.InvalidArgument, "invalid CreatePreparedStatement request")
+	}
+	sql := strings.TrimSpace(req.GetQuery())
+	if sql == "" {
+		return "", false, status.Error(codes.InvalidArgument, "missing query")
+	}
+	return sql, true, nil
+}
+
+func extractClosePreparedPlanID(body []byte) (string, error) {
+	var native struct {
+		PlanID string `json:"plan_id"`
+	}
+	if err := json.Unmarshal(body, &native); err == nil {
+		id := strings.TrimSpace(native.PlanID)
+		if id == "" {
+			return "", status.Error(codes.InvalidArgument, "missing plan_id")
+		}
+		return id, nil
+	}
+
+	var anyMsg anypb.Any
+	if err := proto.Unmarshal(body, &anyMsg); err != nil {
+		return "", status.Error(codes.InvalidArgument, "invalid ClosePreparedStatement body")
+	}
+	var req pb.ActionClosePreparedStatementRequest
+	if err := anyMsg.UnmarshalTo(&req); err != nil {
+		return "", status.Error(codes.InvalidArgument, "invalid ClosePreparedStatement request")
+	}
+
+	// ADBC/FlightSQL handles are opaque; this server encodes JSON tickets.
+	if t, err := decodeTicket(req.GetPreparedStatementHandle()); err == nil {
+		return t.PlanID, nil
+	}
+
+	id := strings.TrimSpace(string(req.GetPreparedStatementHandle()))
+	if id == "" {
+		return "", status.Error(codes.InvalidArgument, "missing prepared statement handle")
+	}
+	return id, nil
+}
+
 // ─────────────────────────────────────────────
-// HANDSHAKE
+// RPCS
 // ─────────────────────────────────────────────
+
+func (s *Server) GetFlightInfo(ctx context.Context, desc *flight.FlightDescriptor) (*flight.FlightInfo, error) {
+	sql, err := extractSQL(desc)
+	if err != nil {
+		return nil, err
+	}
+
+	plan := s.plans.getOrCreate(sql)
+
+	schema, err := s.schemaForPlan(ctx, plan)
+	if err != nil {
+		return nil, err
+	}
+
+	return &flight.FlightInfo{
+		Schema: schema,
+		Endpoint: []*flight.FlightEndpoint{
+			{Ticket: &flight.Ticket{Ticket: encodeTicket(execTicket{PlanID: plan.ID})}},
+		},
+	}, nil
+}
+
+func (s *Server) GetSchema(ctx context.Context, desc *flight.FlightDescriptor) (*flight.SchemaResult, error) {
+	sql, err := extractSQL(desc)
+	if err != nil {
+		return nil, err
+	}
+
+	plan := s.plans.getOrCreate(sql)
+
+	schema, err := s.schemaForPlan(ctx, plan)
+	if err != nil {
+		return nil, err
+	}
+
+	return &flight.SchemaResult{Schema: schema}, nil
+}
+
+func (s *Server) DoGet(ticket *flight.Ticket, stream flight.FlightService_DoGetServer) error {
+	t, err := decodeTicket(ticket.Ticket)
+	if err != nil {
+		return err
+	}
+
+	plan, ok := s.plans.get(t.PlanID)
+	if !ok {
+		return status.Error(codes.NotFound, "plan not found")
+	}
+
+	reader, cleanup, err := s.execute(stream.Context(), plan)
+	if err != nil {
+		return err
+	}
+	defer cleanup()
+
+	w := flight.NewRecordWriter(stream,
+		ipc.WithSchema(reader.Schema()),
+	)
+	defer w.Close()
+
+	return streamRecords(reader, w)
+}
+
+func (s *Server) DoExchange(stream flight.FlightService_DoExchangeServer) error {
+	first, err := stream.Recv()
+	if err != nil {
+		return err
+	}
+
+	sql, err := extractSQL(first.FlightDescriptor)
+	if err != nil {
+		return err
+	}
+
+	plan := s.plans.getOrCreate(sql)
+
+	reader, cleanup, err := s.execute(stream.Context(), plan)
+	if err != nil {
+		return err
+	}
+	defer cleanup()
+
+	w := flight.NewRecordWriter(stream,
+		ipc.WithSchema(reader.Schema()),
+	)
+	defer w.Close()
+
+	return streamRecords(reader, w)
+}
+
+func (s *Server) ListActions(_ *flight.Empty, stream flight.FlightService_ListActionsServer) error {
+	actions := []*flight.ActionType{
+		{Type: "CreatePreparedStatement", Description: "Create a prepared statement"},
+		{Type: "ClosePreparedStatement", Description: "Close a prepared statement"},
+	}
+	for _, a := range actions {
+		if err := stream.Send(a); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *Server) DoAction(action *flight.Action, stream flight.FlightService_DoActionServer) error {
+	switch action.GetType() {
+	case "CreatePreparedStatement":
+		sql, isProtoRequest, err := extractCreatePreparedSQL(action.GetBody())
+		if err != nil {
+			return err
+		}
+
+		plan := s.plans.getOrCreate(sql)
+		ticket := encodeTicket(execTicket{PlanID: plan.ID})
+
+		if !isProtoRequest {
+			// Native Porter client path: return raw JSON ticket bytes directly.
+			return stream.Send(&flight.Result{Body: ticket})
+		}
+
+		// ADBC/FlightSQL path: return Any(ActionCreatePreparedStatementResult).
+		anyRes, err := anypb.New(&pb.ActionCreatePreparedStatementResult{
+			PreparedStatementHandle: ticket,
+		})
+		if err != nil {
+			return err
+		}
+		b, err := proto.Marshal(anyRes)
+		if err != nil {
+			return err
+		}
+		return stream.Send(&flight.Result{Body: b})
+
+	case "ClosePreparedStatement":
+		planID, err := extractClosePreparedPlanID(action.GetBody())
+		if err != nil {
+			return err
+		}
+		s.plans.delete(planID)
+		return nil
+
+	default:
+		return status.Errorf(codes.Unimplemented, "unknown action type: %s", action.GetType())
+	}
+}
 
 func (s *Server) Handshake(stream flight.FlightService_HandshakeServer) error {
 	for {
@@ -415,241 +538,6 @@ func (s *Server) Handshake(stream flight.FlightService_HandshakeServer) error {
 			}
 			return err
 		}
-		if err := stream.Send(&flight.HandshakeResponse{Payload: req.Payload}); err != nil {
-			return err
-		}
-	}
-}
-
-// ─────────────────────────────────────────────
-// LIST FLIGHTS
-//
-// Only plans whose schema has already been cached are emitted.
-// This prevents ListFlights from triggering schema-derivation work across
-// potentially stale or expensive plans in the cache.
-// ─────────────────────────────────────────────
-
-func (s *Server) ListFlights(_ *flight.Criteria, stream flight.FlightService_ListFlightsServer) error {
-	var retErr error
-
-	s.plans.m.Range(func(_, value any) bool {
-		plan := value.(*ExecutionPlan)
-
-		schemaBytes := plan.cachedSchema() // non-blocking
-		if schemaBytes == nil {
-			return true // schema not yet available; skip silently
-		}
-
-		if err := stream.Send(s.buildFlightInfo(plan, schemaBytes)); err != nil {
-			retErr = err
-			return false
-		}
-		return true
-	})
-
-	return retErr
-}
-
-// ─────────────────────────────────────────────
-// GET FLIGHT INFO
-//
-// FlightDescriptor.Cmd = raw SQL bytes.
-// ─────────────────────────────────────────────
-
-func (s *Server) GetFlightInfo(ctx context.Context, desc *flight.FlightDescriptor) (*flight.FlightInfo, error) {
-	sql := strings.TrimSpace(string(desc.Cmd))
-	if sql == "" {
-		return nil, status.Error(codes.InvalidArgument,
-			"FlightDescriptor.Cmd must contain SQL")
-	}
-
-	plan, err := s.planFromSQL(sql)
-	if err != nil {
-		return nil, err
-	}
-
-	schemaBytes, err := s.schemaForPlan(ctx, plan)
-	if err != nil {
-		return nil, err
-	}
-
-	return s.buildFlightInfo(plan, schemaBytes), nil
-}
-
-// ─────────────────────────────────────────────
-// GET SCHEMA
-//
-// FlightDescriptor.Cmd = raw SQL bytes (identical contract to GetFlightInfo).
-// ─────────────────────────────────────────────
-
-func (s *Server) GetSchema(ctx context.Context, desc *flight.FlightDescriptor) (*flight.SchemaResult, error) {
-	sql := strings.TrimSpace(string(desc.Cmd))
-	if sql == "" {
-		return nil, status.Error(codes.InvalidArgument,
-			"FlightDescriptor.Cmd must contain SQL")
-	}
-
-	plan, err := s.planFromSQL(sql)
-	if err != nil {
-		return nil, err
-	}
-
-	schemaBytes, err := s.schemaForPlan(ctx, plan)
-	if err != nil {
-		return nil, err
-	}
-
-	return &flight.SchemaResult{Schema: schemaBytes}, nil
-}
-
-// ─────────────────────────────────────────────
-// DO GET
-//
-// Ticket.Ticket = JSON {"plan_id":"<hex>"}.
-// ─────────────────────────────────────────────
-
-func (s *Server) DoGet(ticket *flight.Ticket, stream flight.FlightService_DoGetServer) error {
-	plan, err := s.getPlanFromTicket(ticket)
-	if err != nil {
-		return err
-	}
-
-	reader, cleanup, err := s.execute(stream.Context(), plan)
-	if err != nil {
-		return err
-	}
-	defer cleanup()
-
-	w := flight.NewRecordWriter(stream,
-		ipc.WithAllocator(s.allocator),
-		ipc.WithSchema(reader.Schema()),
-	)
-	defer w.Close()
-
-	return streamRecords(reader, w)
-}
-
-// ─────────────────────────────────────────────
-// DO EXCHANGE
-//
-// The first FlightData message MUST carry a FlightDescriptor with
-// Cmd = raw SQL bytes.  This is the standard Flight initiation pattern and
-// is supported by all spec-compliant Arrow Flight clients (Go, Python, Java,
-// C++).
-//
-// No AppMetadata dependency.
-// No prior GetFlightInfo round-trip required from the client.
-//
-// Execution and streaming are handled by the same execute() + streamRecords()
-// functions used by DoGet; only plan resolution differs.
-// ─────────────────────────────────────────────
-
-func (s *Server) DoExchange(stream flight.FlightService_DoExchangeServer) error {
-	first, err := stream.Recv()
-	if err != nil {
-		return status.Errorf(codes.InvalidArgument,
-			"DoExchange: recv first message: %v", err)
-	}
-
-	if first.FlightDescriptor == nil {
-		return status.Error(codes.InvalidArgument,
-			"DoExchange: first FlightData must carry a FlightDescriptor")
-	}
-
-	sql := strings.TrimSpace(string(first.FlightDescriptor.Cmd))
-	if sql == "" {
-		return status.Error(codes.InvalidArgument,
-			"DoExchange: FlightDescriptor.Cmd must contain SQL")
-	}
-
-	plan, err := s.planFromSQL(sql)
-	if err != nil {
-		return err
-	}
-
-	reader, cleanup, err := s.execute(stream.Context(), plan)
-	if err != nil {
-		return err
-	}
-	defer cleanup()
-
-	w := flight.NewRecordWriter(stream,
-		ipc.WithAllocator(s.allocator),
-		ipc.WithSchema(reader.Schema()),
-	)
-	defer w.Close()
-
-	return streamRecords(reader, w)
-}
-
-// ─────────────────────────────────────────────
-// ACTIONS
-// ─────────────────────────────────────────────
-
-func (s *Server) ListActions(_ *flight.Empty, stream flight.FlightService_ListActionsServer) error {
-	for _, a := range []flight.ActionType{
-		{
-			Type:        "CreatePreparedStatement",
-			Description: `Register SQL, derive schema eagerly, return plan ticket {"plan_id":"..."}`,
-		},
-		{
-			Type:        "ClosePreparedStatement",
-			Description: "Acknowledge ticket closure (no-op; plans are content-addressed and immutable)",
-		},
-	} {
-		a := a
-		if err := stream.Send(&a); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func (s *Server) DoAction(action *flight.Action, stream flight.FlightService_DoActionServer) error {
-	switch action.Type {
-
-	case "CreatePreparedStatement":
-		var req struct {
-			SQL string `json:"sql"`
-		}
-		dec := json.NewDecoder(strings.NewReader(string(action.Body)))
-		dec.DisallowUnknownFields()
-		if err := dec.Decode(&req); err != nil {
-			return status.Errorf(codes.InvalidArgument,
-				"CreatePreparedStatement: invalid body: %v", err)
-		}
-		if strings.TrimSpace(req.SQL) == "" {
-			return status.Error(codes.InvalidArgument,
-				"CreatePreparedStatement: sql must not be empty")
-		}
-
-		plan, err := s.planFromSQL(req.SQL)
-		if err != nil {
-			return err
-		}
-
-		// Eagerly derive and cache schema so the plan is fully usable
-		// in GetFlightInfo / DoGet without a separate round-trip.
-		if _, err := s.schemaForPlan(stream.Context(), plan); err != nil {
-			return status.Errorf(codes.Internal,
-				"CreatePreparedStatement: schema derivation failed: %v", err)
-		}
-
-		return stream.Send(&flight.Result{
-			Body: encodeTicket(execTicket{PlanID: plan.ID}),
-		})
-
-	case "ClosePreparedStatement":
-		// Plans are content-addressed and immutable; there is no server-side
-		// resource to release.  Validate the body for protocol correctness
-		// and acknowledge.
-		var req struct {
-			PlanID string `json:"plan_id"`
-		}
-		_ = json.Unmarshal(action.Body, &req)
-		return stream.Send(&flight.Result{Body: []byte(`{"ok":true}`)})
-
-	default:
-		return status.Errorf(codes.Unimplemented, "unknown action %q", action.Type)
+		stream.Send(&flight.HandshakeResponse{Payload: req.Payload})
 	}
 }
