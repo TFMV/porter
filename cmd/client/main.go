@@ -1,22 +1,14 @@
-// Package main provides a production-grade Apache Arrow Flight SQL client that
-// exercises the full Flight wire protocol against the DuckDB Flight SQL server:
+// Package main is a production-grade Arrow Flight SQL client that exercises
+// every RPC against the hardened DuckDB Flight SQL server.
 //
-//   - Handshake      (token-based auth echo)
-//   - ListActions    (enumerate server capabilities)
-//   - ListFlights    (enumerate cached plans)
-//   - GetSchema      (schema-only probe, no data transfer)
-//   - Query          (GetFlightInfo → parallel DoGet fanout)
-//   - Prepare        (DoAction CreatePreparedStatement)
-//   - QueryPrepared  (DoGet with plan ticket directly)
-//   - ClosePrepared  (DoAction ClosePreparedStatement)
-//   - Exchange       (DoExchange: GetFlightInfo → plan ticket → bidirectional stream)
+// Server wire contract (must stay in sync with server.go):
 //
-// Server contract (must match server.go):
-//
-//	FlightDescriptor.Cmd  = raw SQL bytes            (GetFlightInfo, GetSchema)
-//	Ticket.Ticket         = JSON {"plan_id":"..."}   (DoGet, DoExchange AppMetadata)
-//	DoAction body         = JSON {"sql":"..."}       (CreatePreparedStatement)
-//	DoAction body         = JSON {"plan_id":"..."}   (ClosePreparedStatement)
+//	GetFlightInfo  FlightDescriptor.Cmd = raw SQL bytes
+//	GetSchema      FlightDescriptor.Cmd = raw SQL bytes
+//	DoGet          Ticket.Ticket        = JSON {"plan_id":"<hex>"}
+//	DoExchange     first FlightData.FlightDescriptor.Cmd = raw SQL bytes
+//	DoAction(CreatePreparedStatement) body = JSON {"sql":"..."}
+//	DoAction(ClosePreparedStatement)  body = JSON {"plan_id":"..."}
 
 package main
 
@@ -43,12 +35,12 @@ import (
 )
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Protocol types  (mirror server's wire format exactly)
+// Protocol types  (mirror server wire format exactly)
 // ─────────────────────────────────────────────────────────────────────────────
 
 // planTicket is the JSON payload the server stores inside Ticket.Ticket.
-// The client only ever receives or echoes these bytes; it never constructs one
-// from scratch (plan IDs are server-assigned).
+// The client only ever receives or echoes these bytes; plan IDs are
+// server-assigned and the client never constructs one.
 type planTicket struct {
 	PlanID string `json:"plan_id"`
 }
@@ -68,21 +60,12 @@ func decodePlanTicket(b []byte) (planTicket, error) {
 // ClientConfig
 // ─────────────────────────────────────────────────────────────────────────────
 
-// ClientConfig controls client-wide behaviour.
 type ClientConfig struct {
-	// Target is the gRPC dial target, e.g. "localhost:32010".
-	Target string
-	// DefaultTenant is sent as x-tenant-id on every call.
-	DefaultTenant string
-	// Token is an optional bearer token sent via Handshake and then attached
-	// to every subsequent call as x-auth-token.
-	Token string
-	// Logger receives structured events. Defaults to slog.Default().
-	Logger *slog.Logger
-	// Allocator is used when decoding Arrow IPC data.
-	Allocator memory.Allocator
-	// DialTimeout caps the gRPC dial phase.
-	DialTimeout time.Duration
+	Target        string           // gRPC dial target, e.g. "localhost:32010"
+	DefaultTenant string           // sent as x-tenant-id on every call
+	Logger        *slog.Logger     // defaults to slog.Default()
+	Allocator     memory.Allocator // used when decoding Arrow IPC data
+	DialTimeout   time.Duration    // caps the gRPC dial phase
 }
 
 func (c *ClientConfig) setDefaults() {
@@ -111,14 +94,12 @@ type QueryResult struct {
 	Batches []arrow.RecordBatch
 }
 
-// Release frees all held Arrow memory.
 func (r *QueryResult) Release() {
 	for _, b := range r.Batches {
 		b.Release()
 	}
 }
 
-// TotalRows returns the sum of rows across all batches.
 func (r *QueryResult) TotalRows() int64 {
 	var n int64
 	for _, b := range r.Batches {
@@ -131,8 +112,7 @@ func (r *QueryResult) TotalRows() int64 {
 // FlightSQLClient
 // ─────────────────────────────────────────────────────────────────────────────
 
-// FlightSQLClient is a production-grade Arrow Flight SQL client.
-// Safe for concurrent use after construction.
+// FlightSQLClient is safe for concurrent use after construction.
 type FlightSQLClient struct {
 	cfg ClientConfig
 	log *slog.Logger
@@ -140,18 +120,16 @@ type FlightSQLClient struct {
 	cc  *grpc.ClientConn
 
 	authMu    sync.RWMutex
-	authToken string // populated after Handshake succeeds
+	authToken string // set after a successful Handshake
 }
 
-// NewFlightSQLClient dials the server and returns a ready client.
-// Call Close when done.
 func NewFlightSQLClient(cfg ClientConfig) (*FlightSQLClient, error) {
 	cfg.setDefaults()
 
 	dialCtx, cancel := context.WithTimeout(context.Background(), cfg.DialTimeout)
 	defer cancel()
 
-	//nolint:staticcheck // grpc.DialContext is stable in the versions we target
+	//nolint:staticcheck
 	cc, err := grpc.DialContext(dialCtx, cfg.Target,
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
 		grpc.WithBlock(),
@@ -168,14 +146,12 @@ func NewFlightSQLClient(cfg ClientConfig) (*FlightSQLClient, error) {
 	}, nil
 }
 
-// Close tears down the underlying gRPC connection.
 func (c *FlightSQLClient) Close() error { return c.cc.Close() }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Context helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
-// baseCtx attaches session / tenant metadata and the auth token (if any).
 func (c *FlightSQLClient) baseCtx(ctx context.Context, sessionID string) context.Context {
 	pairs := []string{
 		"x-session-id", sessionID,
@@ -193,9 +169,9 @@ func (c *FlightSQLClient) baseCtx(ctx context.Context, sessionID string) context
 // Handshake
 // ─────────────────────────────────────────────────────────────────────────────
 
-// Handshake performs the Flight auth handshake. The server echoes the payload
-// back unchanged; if the response is non-empty it is stored as the auth token
-// and attached to all subsequent calls automatically.
+// Handshake performs the Flight auth handshake. The reference server echoes
+// the token back unchanged; if the response is non-empty it is stored and
+// attached to all subsequent calls automatically.
 func (c *FlightSQLClient) Handshake(ctx context.Context, token string) error {
 	stream, err := c.raw.Handshake(ctx)
 	if err != nil {
@@ -226,7 +202,6 @@ func (c *FlightSQLClient) Handshake(ctx context.Context, token string) error {
 // ListActions
 // ─────────────────────────────────────────────────────────────────────────────
 
-// ListActions returns all action types the server supports.
 func (c *FlightSQLClient) ListActions(ctx context.Context, sessionID string) ([]*flight.ActionType, error) {
 	ctx = c.baseCtx(ctx, sessionID)
 
@@ -256,7 +231,7 @@ func (c *FlightSQLClient) ListActions(ctx context.Context, sessionID string) ([]
 // ListFlights
 // ─────────────────────────────────────────────────────────────────────────────
 
-// ListFlights enumerates all flights the server advertises.
+// ListFlights enumerates all plans the server has with cached schemas.
 // Pass nil criteria to list everything.
 func (c *FlightSQLClient) ListFlights(ctx context.Context, sessionID string, criteria *flight.Criteria) ([]*flight.FlightInfo, error) {
 	ctx = c.baseCtx(ctx, sessionID)
@@ -291,23 +266,21 @@ func (c *FlightSQLClient) ListFlights(ctx context.Context, sessionID string, cri
 // GetSchema  (schema-only probe – no data transfer)
 // ─────────────────────────────────────────────────────────────────────────────
 
-// GetSchema returns the Arrow schema for sql without executing the query or
-// transferring any record batches.
-//
+// GetSchema returns the Arrow schema for sql without executing the query.
 // Server contract: FlightDescriptor.Cmd = raw SQL bytes.
 func (c *FlightSQLClient) GetSchema(ctx context.Context, sessionID, sql string) (*arrow.Schema, error) {
 	ctx = c.baseCtx(ctx, sessionID)
 
 	resp, err := c.raw.GetSchema(ctx, &flight.FlightDescriptor{
 		Type: flight.DescriptorCMD,
-		Cmd:  []byte(sql), // raw SQL – NOT JSON
+		Cmd:  []byte(sql), // raw SQL — NOT JSON
 	})
 	if err != nil {
 		return nil, fmt.Errorf("GetSchema: %w", err)
 	}
 	schema, err := flight.DeserializeSchema(resp.Schema, c.cfg.Allocator)
 	if err != nil {
-		return nil, fmt.Errorf("GetSchema: deserialize schema: %w", err)
+		return nil, fmt.Errorf("GetSchema: deserialize: %w", err)
 	}
 	c.log.InfoContext(ctx, "GetSchema",
 		slog.String("sql", sql),
@@ -317,17 +290,16 @@ func (c *FlightSQLClient) GetSchema(ctx context.Context, sessionID, sql string) 
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// getFlightInfo  (internal: GetFlightInfo for raw SQL)
+// GetFlightInfo  (internal helper)
 // ─────────────────────────────────────────────────────────────────────────────
 
 // getFlightInfo calls GetFlightInfo with raw SQL in Cmd and returns all
 // endpoint tickets.
-//
 // Server contract: FlightDescriptor.Cmd = raw SQL bytes.
 func (c *FlightSQLClient) getFlightInfo(ctx context.Context, sql string) ([]*flight.Ticket, error) {
 	info, err := c.raw.GetFlightInfo(ctx, &flight.FlightDescriptor{
 		Type: flight.DescriptorCMD,
-		Cmd:  []byte(sql), // raw SQL – NOT JSON
+		Cmd:  []byte(sql), // raw SQL — NOT JSON
 	})
 	if err != nil {
 		return nil, fmt.Errorf("GetFlightInfo: %w", err)
@@ -346,7 +318,6 @@ func (c *FlightSQLClient) getFlightInfo(ctx context.Context, sql string) ([]*fli
 // DoGet  – single ticket
 // ─────────────────────────────────────────────────────────────────────────────
 
-// doGet fetches a single plan ticket and collects all record batches.
 func (c *FlightSQLClient) doGet(ctx context.Context, ticket *flight.Ticket) (*QueryResult, error) {
 	stream, err := c.raw.DoGet(ctx, ticket)
 	if err != nil {
@@ -381,8 +352,7 @@ type shardResult struct {
 	err    error
 }
 
-// Query executes sql, fans out across all endpoints returned by GetFlightInfo,
-// and returns per-shard results in index order.
+// Query executes sql via GetFlightInfo + parallel DoGet across all endpoints.
 // Each QueryResult must be Released by the caller.
 func (c *FlightSQLClient) Query(ctx context.Context, sessionID, sql string) ([]*QueryResult, error) {
 	ctx = c.baseCtx(ctx, sessionID)
@@ -394,7 +364,6 @@ func (c *FlightSQLClient) Query(ctx context.Context, sessionID, sql string) ([]*
 	return c.fanout(ctx, tickets)
 }
 
-// fanout fires one DoGet goroutine per ticket and collects results in order.
 func (c *FlightSQLClient) fanout(ctx context.Context, tickets []*flight.Ticket) ([]*QueryResult, error) {
 	ch := make(chan shardResult, len(tickets))
 
@@ -432,8 +401,6 @@ func (c *FlightSQLClient) fanout(ctx context.Context, tickets []*flight.Ticket) 
 
 // Prepare sends a CreatePreparedStatement action and returns the opaque plan
 // ticket bytes (JSON {"plan_id":"..."}) assigned by the server.
-// Pass the returned bytes to QueryPrepared or ClosePrepared.
-//
 // Server contract: action Body = JSON {"sql":"..."}.
 func (c *FlightSQLClient) Prepare(ctx context.Context, sessionID, sql string) ([]byte, error) {
 	ctx = c.baseCtx(ctx, sessionID)
@@ -468,14 +435,11 @@ func (c *FlightSQLClient) Prepare(ctx context.Context, sessionID, sql string) ([
 	if len(ticket) == 0 {
 		return nil, errors.New("Prepare: server returned empty ticket")
 	}
-
-	// Validate the server returned a well-formed plan ticket.
 	pt, err := decodePlanTicket(ticket)
 	if err != nil {
 		return nil, fmt.Errorf("Prepare: bad ticket from server: %w", err)
 	}
 	c.log.InfoContext(ctx, "prepared statement created", slog.String("plan_id", pt.PlanID))
-
 	return ticket, nil
 }
 
@@ -486,7 +450,6 @@ func (c *FlightSQLClient) Prepare(ctx context.Context, sessionID, sql string) ([
 func (c *FlightSQLClient) QueryPrepared(ctx context.Context, sessionID string, prepTicket []byte) ([]*QueryResult, error) {
 	ctx = c.baseCtx(ctx, sessionID)
 
-	// The plan ticket is directly usable as a DoGet ticket.
 	result, err := c.doGet(ctx, &flight.Ticket{Ticket: prepTicket})
 	if err != nil {
 		return nil, fmt.Errorf("QueryPrepared: %w", err)
@@ -496,7 +459,6 @@ func (c *FlightSQLClient) QueryPrepared(ctx context.Context, sessionID string, p
 
 // ClosePrepared releases server-side resources for a prepared statement.
 // Always call this (ideally via defer) after Prepare succeeds.
-//
 // Server contract: action Body = JSON {"plan_id":"..."}.
 func (c *FlightSQLClient) ClosePrepared(ctx context.Context, sessionID string, prepTicket []byte) error {
 	ctx = c.baseCtx(ctx, sessionID)
@@ -505,12 +467,11 @@ func (c *FlightSQLClient) ClosePrepared(ctx context.Context, sessionID string, p
 	if err != nil {
 		return fmt.Errorf("ClosePrepared: %w", err)
 	}
-
 	body, err := json.Marshal(struct {
-		PlanID string `json:"plan_id"` // server key is plan_id, not prepared_id
+		PlanID string `json:"plan_id"` // server key is plan_id
 	}{PlanID: pt.PlanID})
 	if err != nil {
-		return fmt.Errorf("ClosePrepared: marshal body: %w", err)
+		return fmt.Errorf("ClosePrepared: marshal: %w", err)
 	}
 
 	stream, err := c.raw.DoAction(ctx, &flight.Action{
@@ -522,7 +483,6 @@ func (c *FlightSQLClient) ClosePrepared(ctx context.Context, sessionID string, p
 	}
 	defer stream.CloseSend() //nolint:errcheck
 
-	// Drain the response stream.
 	for {
 		_, err := stream.Recv()
 		if errors.Is(err, io.EOF) {
@@ -540,46 +500,40 @@ func (c *FlightSQLClient) ClosePrepared(ctx context.Context, sessionID string, p
 // DoExchange  – bidirectional streaming
 // ─────────────────────────────────────────────────────────────────────────────
 
-// Exchange executes sql via the DoExchange RPC and collects all result batches.
+// Exchange executes sql via DoExchange.
 //
-// Protocol:
-//  1. Call GetFlightInfo(sql) to register the plan and receive its plan ticket.
-//  2. Open DoExchange and send the plan ticket in AppMetadata of the first
-//     FlightData frame (DataBody left empty).
-//  3. CloseSend, then read IPC records from the response stream.
+// Protocol (matches server DoExchange contract):
+//  1. Send a single FlightData with FlightDescriptor.Cmd = raw SQL bytes.
+//     No prior GetFlightInfo call is needed; the server registers the plan
+//     internally.
+//  2. CloseSend.
+//  3. Read the IPC record stream from the server.
 //
-// One DoExchange call handles one SQL statement. For multiple statements,
-// call Exchange once per SQL.
-//
-// Server contract: first message AppMetadata = plan ticket bytes ({"plan_id":"..."}).
+// This approach requires no AppMetadata and works with any spec-compliant
+// Arrow Flight client. Call once per SQL statement.
 func (c *FlightSQLClient) Exchange(ctx context.Context, sessionID, sql string) (*QueryResult, error) {
 	ctx = c.baseCtx(ctx, sessionID)
 
-	// Step 1 – register the SQL, get the plan ticket.
-	tickets, err := c.getFlightInfo(ctx, sql)
-	if err != nil {
-		return nil, fmt.Errorf("Exchange: GetFlightInfo: %w", err)
-	}
-	// Use the first (and typically only) endpoint ticket as the plan identifier.
-	planTicketBytes := tickets[0].Ticket
-
-	// Step 2 – open the exchange stream and send the plan ticket.
 	stream, err := c.raw.DoExchange(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("Exchange: open stream: %w", err)
 	}
 
+	// Send the SQL in FlightDescriptor.Cmd of the first (and only) message.
 	if err := stream.Send(&flight.FlightData{
-		AppMetadata: planTicketBytes, // server reads AppMetadata, not DataHeader
+		FlightDescriptor: &flight.FlightDescriptor{
+			Type: flight.DescriptorCMD,
+			Cmd:  []byte(sql), // raw SQL — NOT JSON, NOT a plan ticket
+		},
 	}); err != nil {
 		_ = stream.CloseSend()
-		return nil, fmt.Errorf("Exchange: send ticket: %w", err)
+		return nil, fmt.Errorf("Exchange: send descriptor: %w", err)
 	}
 	if err := stream.CloseSend(); err != nil {
 		return nil, fmt.Errorf("Exchange: CloseSend: %w", err)
 	}
 
-	// Step 3 – read IPC record stream from the server.
+	// Read the IPC record stream using the standard Flight reader.
 	reader, err := flight.NewRecordReader(stream, ipc.WithAllocator(c.cfg.Allocator))
 	if err != nil {
 		return nil, fmt.Errorf("Exchange: NewRecordReader: %w", err)
@@ -653,16 +607,13 @@ func main() {
 	ctx := context.Background()
 	session := "sess-demo"
 
-	// ── 1. Handshake ────────────────────────────────────────────────────────
-	// The reference server echoes the payload back; no real auth is enforced.
-
+	// ── 1. Handshake ─────────────────────────────────────────────────────────
 	log.Info("── 1. Handshake")
 	if err := client.Handshake(ctx, "demo-token"); err != nil {
 		log.Warn("handshake failed (server may not require auth)", slog.Any("err", err))
 	}
 
-	// ── 2. ListActions ──────────────────────────────────────────────────────
-
+	// ── 2. ListActions ───────────────────────────────────────────────────────
 	log.Info("── 2. ListActions")
 	actions, err := client.ListActions(ctx, session)
 	if err != nil {
@@ -675,18 +626,15 @@ func main() {
 		)
 	}
 
-	// ── 3. ListFlights ──────────────────────────────────────────────────────
-	// The plan cache is empty at startup; non-zero count only after queries.
-
-	log.Info("── 3. ListFlights")
+	// ── 3. ListFlights (empty — no plans cached yet) ─────────────────────────
+	log.Info("── 3. ListFlights (before any queries)")
 	flights, err := client.ListFlights(ctx, session, nil)
 	if err != nil {
 		log.Warn("ListFlights", slog.Any("err", err))
 	}
 	log.Info("ListFlights", slog.Int("count", len(flights)))
 
-	// ── 4. GetSchema  (schema probe, no data) ───────────────────────────────
-
+	// ── 4. GetSchema (schema probe, no data) ─────────────────────────────────
 	log.Info("── 4. GetSchema")
 	schema, err := client.GetSchema(ctx, session, "SELECT 1 AS n, 'hello' AS s")
 	if err != nil {
@@ -695,9 +643,8 @@ func main() {
 	}
 	log.Info("schema", slog.String("schema", schema.String()))
 
-	// ── 5. Query  (GetFlightInfo → parallel DoGet fanout) ───────────────────
-
-	log.Info("── 5. Query (sql fanout)")
+	// ── 5. Query (GetFlightInfo → parallel DoGet fanout) ─────────────────────
+	log.Info("── 5. Query")
 	results, err := client.Query(ctx, session, "SELECT 1 AS n")
 	if err != nil {
 		log.Error("Query", slog.Any("err", err))
@@ -708,8 +655,7 @@ func main() {
 		r.Release()
 	}
 
-	// ── 6. ListFlights again  (plan cache now populated) ────────────────────
-
+	// ── 6. ListFlights (plans now cached) ────────────────────────────────────
 	log.Info("── 6. ListFlights (after queries)")
 	flights, err = client.ListFlights(ctx, session, nil)
 	if err != nil {
@@ -717,9 +663,7 @@ func main() {
 	}
 	log.Info("ListFlights", slog.Int("count", len(flights)))
 
-	// ── 7. Prepared statement lifecycle ─────────────────────────────────────
-	//      Prepare → DoGet with plan ticket → ClosePrepared
-
+	// ── 7. Prepared statement (Prepare → DoGet → Close) ──────────────────────
 	log.Info("── 7. Prepared statement")
 	prepTicket, err := client.Prepare(ctx, session, "SELECT 42 AS answer")
 	if err != nil {
@@ -742,8 +686,7 @@ func main() {
 		r.Release()
 	}
 
-	// ── 8. DoExchange  (GetFlightInfo → plan ticket → bidirectional stream) ─
-
+	// ── 8. DoExchange (FlightDescriptor.Cmd = raw SQL, one call per query) ───
 	log.Info("── 8. DoExchange")
 	for _, sql := range []string{
 		"SELECT 100 AS x",
