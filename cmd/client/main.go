@@ -166,10 +166,15 @@ func main() {
 	fmt.Println("rows inserted:", rows)
 
 	// verify
-	verify, _ := conn.NewStatement()
+	verify, err := conn.NewStatement()
+	if err != nil {
+		log.Fatal(err)
+	}
 	defer verify.Close()
 
-	verify.SetSqlQuery(`SELECT * FROM demo`)
+	if err := verify.SetSqlQuery(`SELECT * FROM demo`); err != nil {
+		log.Fatal(err)
+	}
 	stream4, _, err := verify.ExecuteQuery(ctx)
 	if err != nil {
 		log.Fatal(err)
@@ -181,7 +186,7 @@ func main() {
 	// ─────────────────────────────────────────────
 	fmt.Println("\n=== DoExchange ===")
 
-	flightClient, err := flight.NewFlightClient("127.0.0.1:32010", nil, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	flightClient, err := flight.NewClientWithMiddleware("127.0.0.1:32010", nil, nil, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
 		log.Fatal("NewFlightClient:", err)
 	}

@@ -112,6 +112,57 @@ Both will issue queries and stream Arrow record batches back from Flight.
 
 ---
 
+## 💻 CLI Usage
+
+Porter also exposes a developer-facing CLI under `cmd/porter`. The built CLI is a small, composable tool for local workflows.
+
+### Build and use the Porter CLI
+
+```bash
+go build -o porter ./cmd/porter
+./porter --help
+```
+
+### Run the server
+
+The default action is `serve`, so `./porter` behaves the same as `./porter serve`.
+
+```bash
+./porter serve --db :memory: --port 32010
+# or simply
+./porter --db :memory: --port 32010
+```
+
+### Execute a single query
+
+```bash
+./porter query "SELECT 1 AS value"
+```
+
+### Start an interactive REPL
+
+```bash
+./porter repl
+```
+
+### Load Parquet data
+
+```bash
+./porter load data.parquet
+```
+
+### Inspect a table schema
+
+```bash
+./porter schema table_name
+```
+
+### Environment variables
+
+`PORTER_DB` and `PORTER_PORT` are supported as alternate configuration sources.
+
+---
+
 ## 🧠 Execution Model
 
 Porter supports two execution paths:

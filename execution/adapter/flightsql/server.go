@@ -383,7 +383,7 @@ func pumpRecords(
 	defer cleanup()
 
 	for reader.Next() {
-		rec := reader.Record()
+		rec := reader.RecordBatch()
 		rec.Retain()
 		select {
 		case ch <- flight.StreamChunk{Data: rec}:
@@ -726,26 +726,6 @@ func (r *flightDataStreamReader) Recv() (*flight.FlightData, error) {
 		return msg, nil
 	}
 	return r.stream.Recv()
-}
-
-func (s *Server) recvFlightData(ctx context.Context, stream flight.FlightService_DoExchangeServer) (*flight.FlightData, error) {
-	type result struct {
-		msg *flight.FlightData
-		err error
-	}
-
-	ch := make(chan result, 1)
-	go func() {
-		msg, err := stream.Recv()
-		ch <- result{msg: msg, err: err}
-	}()
-
-	select {
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	case res := <-ch:
-		return res.msg, res.err
-	}
 }
 
 func (s *Server) readFlightDataParameterBatch(firstMsg *flight.FlightData, stream flight.FlightService_DoExchangeServer) (arrow.RecordBatch, error) {
