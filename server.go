@@ -34,8 +34,7 @@ type ExecTicket struct {
 	Type       string `json:"type"`
 	SQL        string `json:"sql,omitempty"`
 	PreparedID string `json:"prepared_id,omitempty"`
-
-	QueryID string `json:"query_id"`
+	QueryID    string `json:"query_id"`
 }
 
 func encodeTicket(t ExecTicket) []byte {
@@ -64,12 +63,18 @@ type connPool struct {
 	mu    sync.Mutex
 	conns []adbc.Connection
 	drv   adbc.Driver
+	path  string
 }
 
-func newPool() *connPool {
+func newPool(path string) *connPool {
+	if path == "" {
+		path = ":memory:"
+	}
+
 	return &connPool{
 		drv:   drivermgr.Driver{},
 		conns: make([]adbc.Connection, 0, 8),
+		path:  path,
 	}
 }
 
@@ -85,7 +90,7 @@ func (p *connPool) get(ctx context.Context) (adbc.Connection, error) {
 
 	db, err := p.drv.NewDatabase(map[string]string{
 		"driver": "duckdb",
-		"path":   ":memory:",
+		"path":   p.path,
 	})
 	if err != nil {
 		return nil, err
@@ -112,12 +117,19 @@ type Server struct {
 	allocator memory.Allocator
 	pool      *connPool
 	prepared  sync.Map
+
+	dbPath string
 }
 
-func NewServer() *Server {
+func NewServer(dbPath string) *Server {
+	if dbPath == "" {
+		dbPath = ":memory:"
+	}
+
 	return &Server{
 		allocator: memory.NewGoAllocator(),
-		pool:      newPool(),
+		pool:      newPool(dbPath),
+		dbPath:    dbPath,
 	}
 }
 
@@ -206,8 +218,8 @@ func (s *Server) ListActions(
 ) error {
 
 	actions := []*flight.ActionType{
-		{Type: "CreatePreparedStatement", Description: "create prepared statement"},
-		{Type: "ClosePreparedStatement", Description: "close prepared statement"},
+		{Type: "CreatePreparedStatement"},
+		{Type: "ClosePreparedStatement"},
 	}
 
 	for _, a := range actions {
@@ -234,7 +246,7 @@ func (s *Server) ListFlights(
 
 //
 // ─────────────────────────────────────────────
-// GET FLIGHT INFO (SINGLE ENDPOINT ONLY)
+// GET FLIGHT INFO
 // ─────────────────────────────────────────────
 //
 
@@ -270,34 +282,31 @@ func (s *Server) GetFlightInfo(ctx context.Context, desc *flight.FlightDescripto
 	schema := serializeSchema(reader.Schema())
 	queryID := hashSQL(sql) + fmt.Sprintf("-%d", time.Now().UnixNano())
 
-	endpoint := &flight.FlightEndpoint{
-		Ticket: &flight.Ticket{
-			Ticket: encodeTicket(ExecTicket{
-				Type:    t.Type,
-				SQL:     sql,
-				QueryID: queryID,
-			}),
-		},
-	}
-
 	return &flight.FlightInfo{
-		Schema:   schema,
-		Endpoint: []*flight.FlightEndpoint{endpoint},
+		Schema: schema,
+		Endpoint: []*flight.FlightEndpoint{
+			{
+				Ticket: &flight.Ticket{
+					Ticket: encodeTicket(ExecTicket{
+						Type:    t.Type,
+						SQL:     sql,
+						QueryID: queryID,
+					}),
+				},
+			},
+		},
 	}, nil
 }
 
 //
 // ─────────────────────────────────────────────
-// DO EXCHANGE (FULL DUPLEX EXECUTION)
+// DO EXCHANGE
 // ─────────────────────────────────────────────
 //
 
 func (s *Server) DoExchange(stream flight.FlightService_DoExchangeServer) error {
 	ctx := stream.Context()
 
-	// =================================================
-	// 1. FIRST MESSAGE = TICKET (DataHeader ONLY)
-	// =================================================
 	first, err := stream.Recv()
 	if err != nil {
 		if errors.Is(err, io.EOF) {
@@ -320,9 +329,6 @@ func (s *Server) DoExchange(stream flight.FlightService_DoExchangeServer) error 
 		return err
 	}
 
-	// =================================================
-	// 2. PARAM STREAM (optional Arrow IPC records)
-	// =================================================
 	var lastParam arrow.Record
 
 	for {
@@ -335,7 +341,7 @@ func (s *Server) DoExchange(stream flight.FlightService_DoExchangeServer) error 
 			if errors.Is(err, io.EOF) {
 				break
 			}
-			return status.Errorf(codes.Internal, "recv failed: %v", err)
+			return err
 		}
 
 		if len(msg.DataBody) == 0 {
@@ -346,7 +352,7 @@ func (s *Server) DoExchange(stream flight.FlightService_DoExchangeServer) error 
 			ipc.WithAllocator(s.allocator),
 		)
 		if err != nil {
-			return status.Errorf(codes.Internal, "ipc decode failed: %v", err)
+			return err
 		}
 
 		for rdr.Next() {
@@ -362,11 +368,8 @@ func (s *Server) DoExchange(stream flight.FlightService_DoExchangeServer) error 
 		rdr.Release()
 	}
 
-	_ = lastParam // (wire this into execution later if needed)
+	_ = lastParam
 
-	// =================================================
-	// 3. EXECUTE QUERY
-	// =================================================
 	conn, err := s.pool.get(ctx)
 	if err != nil {
 		return err
@@ -379,9 +382,7 @@ func (s *Server) DoExchange(stream flight.FlightService_DoExchangeServer) error 
 	}
 	defer stmt.Close()
 
-	if err := stmt.SetSqlQuery(sql); err != nil {
-		return err
-	}
+	_ = stmt.SetSqlQuery(sql)
 
 	reader, _, err := stmt.ExecuteQuery(ctx)
 	if err != nil {
@@ -389,10 +390,6 @@ func (s *Server) DoExchange(stream flight.FlightService_DoExchangeServer) error 
 	}
 	defer reader.Release()
 
-	// =================================================
-	// 4. STREAM RESPONSE AS SINGLE IPC STREAM
-	//    (schema + all batches in ONE writer)
-	// =================================================
 	var buf bytes.Buffer
 
 	w := ipc.NewWriter(&buf,
@@ -401,30 +398,20 @@ func (s *Server) DoExchange(stream flight.FlightService_DoExchangeServer) error 
 	)
 	defer w.Close()
 
-	// write all batches continuously
 	for reader.Next() {
 		if err := ctx.Err(); err != nil {
 			return status.Error(codes.Canceled, err.Error())
 		}
 
-		rec := reader.Record()
-
-		if err := w.Write(rec); err != nil {
-			return status.Errorf(codes.Internal, "ipc write failed: %v", err)
+		if err := w.Write(reader.Record()); err != nil {
+			return err
 		}
 	}
 
-	if err := reader.Err(); err != nil {
+	if err := w.Close(); err != nil {
 		return err
 	}
 
-	if err := w.Close(); err != nil {
-		return status.Errorf(codes.Internal, "ipc finalize failed: %v", err)
-	}
-
-	// =================================================
-	// 5. SEND ONCE (clean Flight semantics)
-	// =================================================
 	return stream.Send(&flight.FlightData{
 		DataBody: buf.Bytes(),
 	})
@@ -432,7 +419,7 @@ func (s *Server) DoExchange(stream flight.FlightService_DoExchangeServer) error 
 
 //
 // ─────────────────────────────────────────────
-// DO GET (SINGLE STREAM EXECUTION)
+// DO GET
 // ─────────────────────────────────────────────
 //
 
@@ -477,7 +464,7 @@ func (s *Server) DoGet(ticket *flight.Ticket, stream flight.FlightService_DoGetS
 
 //
 // ─────────────────────────────────────────────
-// DO ACTION (PREPARED STATEMENTS)
+// DO ACTION
 // ─────────────────────────────────────────────
 //
 

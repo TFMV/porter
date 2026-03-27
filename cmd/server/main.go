@@ -10,37 +10,29 @@ import (
 	"syscall"
 	"time"
 
-	flightsql "github.com/TFMV/porter"
+	porter "github.com/TFMV/porter"
 	"github.com/apache/arrow-go/v18/arrow/flight"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 )
 
-//
-// ─────────────────────────────────────────────────────────────────────────────
-// ENTRYPOINT
-// ─────────────────────────────────────────────────────────────────────────────
-//
-
 func main() {
 	log := slog.New(slog.NewTextHandler(os.Stdout, nil))
-
 	cfg := loadConfig()
 
 	log.Info("starting flight sql server",
-		"addr", cfg.addr,
-		"max_recv_mb", cfg.maxRecvMB,
-		"max_send_mb", cfg.maxSendMB,
+		"addr", cfg.Addr,
+		"max_recv_mb", cfg.MaxRecvMB,
+		"max_send_mb", cfg.MaxSendMB,
 	)
 
-	lis, err := net.Listen("tcp", cfg.addr)
+	lis, err := net.Listen("tcp", cfg.Addr)
 	if err != nil {
 		log.Error("listen failed", "err", err)
 		os.Exit(1)
 	}
 
-	// Single-node execution model (no shard fan-out)
-	srv := flightsql.NewServer()
+	srv := porter.NewServer(":memory:")
 
 	grpcServer := grpc.NewServer(
 		grpc.MaxRecvMsgSize(cfg.maxRecvBytes()),
@@ -53,19 +45,16 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	serveErr := make(chan error, 1)
+	errCh := make(chan error, 1)
 
 	go func() {
-		log.Info("server listening", "addr", cfg.addr)
-
-		if err := grpcServer.Serve(lis); err != nil {
-			serveErr <- err
-		}
+		log.Info("grpc serving", "addr", cfg.Addr)
+		errCh <- grpcServer.Serve(lis)
 	}()
 
 	select {
-	case err := <-serveErr:
-		log.Error("grpc server failed", "err", err)
+	case err := <-errCh:
+		log.Error("grpc server error", "err", err)
 		os.Exit(1)
 
 	case <-ctx.Done():
@@ -75,6 +64,10 @@ func main() {
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
+	shutdown(grpcServer, srv, shutdownCtx, log)
+}
+
+func shutdown(grpcServer *grpc.Server, srv any, ctx context.Context, log *slog.Logger) {
 	done := make(chan struct{})
 
 	go func() {
@@ -82,10 +75,12 @@ func main() {
 
 		grpcServer.GracefulStop()
 
-		if s, ok := any(srv).(interface {
+		if s, ok := srv.(interface {
 			Shutdown(context.Context) error
 		}); ok {
-			_ = s.Shutdown(shutdownCtx)
+			if err := s.Shutdown(ctx); err != nil {
+				log.Warn("server shutdown error", "err", err)
+			}
 		}
 	}()
 
@@ -93,54 +88,49 @@ func main() {
 	case <-done:
 		log.Info("shutdown complete")
 
-	case <-shutdownCtx.Done():
-		log.Warn("forced shutdown (timeout exceeded)")
+	case <-ctx.Done():
+		log.Warn("forced shutdown (timeout)")
 		grpcServer.Stop()
 	}
 }
 
 //
-// ─────────────────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────
 // CONFIG
-// ─────────────────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────
 //
 
 type config struct {
-	addr      string
-	maxRecvMB int
-	maxSendMB int
+	Addr      string
+	MaxRecvMB int
+	MaxSendMB int
 }
 
 func loadConfig() config {
 	return config{
-		addr:      getEnv("FLIGHT_ADDR", ":50051"),
-		maxRecvMB: getEnvInt("GRPC_MAX_RECV_MB", 64),
-		maxSendMB: getEnvInt("GRPC_MAX_SEND_MB", 64),
+		Addr:      env("FLIGHT_ADDR", ":50051"),
+		MaxRecvMB: envInt("GRPC_MAX_RECV_MB", 64),
+		MaxSendMB: envInt("GRPC_MAX_SEND_MB", 64),
 	}
 }
 
-func (c config) maxRecvBytes() int {
-	return c.maxRecvMB << 20
-}
-
-func (c config) maxSendBytes() int {
-	return c.maxSendMB << 20
-}
+func (c config) maxRecvBytes() int { return c.MaxRecvMB << 20 }
+func (c config) maxSendBytes() int { return c.MaxSendMB << 20 }
 
 //
-// ─────────────────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────
 // ENV HELPERS
-// ─────────────────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────
 //
 
-func getEnv(key, def string) string {
+func env(key, def string) string {
 	if v := os.Getenv(key); v != "" {
 		return v
 	}
 	return def
 }
 
-func getEnvInt(key string, def int) int {
+func envInt(key string, def int) int {
 	v := os.Getenv(key)
 	if v == "" {
 		return def
