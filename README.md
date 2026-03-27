@@ -20,21 +20,15 @@ Just a clean, fast path from **SQL → Arrow**.
 
 ## ⚠️ What It Is *Not*
 
-Porter is **not a generic ADBC / Flight SQL endpoint**.
+Porter is **not trying to be the entire Flight SQL universe**.
 
-It intentionally avoids parts of the spec that introduce unnecessary indirection:
+It focuses on the happy path and a practical compatibility layer:
 
-* No protobuf-wrapped SQL commands
-* No driver-manager abstraction layer
-* No “universal” compatibility guarantees
+* Supports native Porter payloads (raw SQL + JSON tickets)
+* Supports core Flight SQL protobuf commands used by ADBC
+* Skips kitchen-sink features and keeps behavior explicit
 
-Instead, Porter speaks a **tight, explicit Flight contract**:
-
-* SQL is sent as raw bytes
-* Tickets are server-issued and opaque
-* Streams are Arrow IPC, end to end
-
-If you want full cross-driver compatibility, use a reference Flight SQL server.
+If you need every optional Flight SQL extension under the sun, use GizmoSQL.
 
 If you want something fast, understandable, and hackable — use Porter.
 
@@ -68,19 +62,17 @@ A straight line. No detours.
 
 ## ✈️ Wire Contract (Important)
 
-Porter uses a **simplified Flight SQL protocol**:
+Porter now speaks **two input paths** for query and prepared-statement flow:
 
-| RPC             | Payload                                |
-| --------------- | -------------------------------------- |
-| `GetFlightInfo` | `FlightDescriptor.Cmd = raw SQL bytes` |
-| `GetSchema`     | `FlightDescriptor.Cmd = raw SQL bytes` |
-| `DoGet`         | `Ticket = {"plan_id": "..."}` (JSON)   |
-| `DoExchange`    | First message contains raw SQL         |
-| `DoAction`      | JSON for prepared statement lifecycle  |
+| RPC             | Native Porter Path                                   | Flight SQL / ADBC Path                                                      |
+| --------------- | ---------------------------------------------------- | --------------------------------------------------------------------------- |
+| `GetFlightInfo` | `FlightDescriptor.Cmd = raw SQL bytes`               | `FlightDescriptor.Cmd = Any(CommandStatementQuery)`                         |
+| `GetSchema`     | `FlightDescriptor.Cmd = raw SQL bytes`               | `FlightDescriptor.Cmd = Any(CommandStatementQuery)`                         |
+| `DoGet`         | `Ticket = {"plan_id":"..."}` (JSON bytes)            | Prepared statement handle resolves to the same ticket bytes                 |
+| `DoExchange`    | First message `FlightDescriptor.Cmd = raw SQL bytes` | (same behavior)                                                             |
+| `DoAction`      | JSON bodies for create/close prepared statements      | `Any(ActionCreatePreparedStatementRequest/Result)` + `Any(ActionClose...)` |
 
-No protobuf `CommandStatementQuery`.
-No driver translation layer.
-No surprises.
+In short: one engine, two ways in.
 
 ---
 
@@ -112,35 +104,32 @@ You should see streamed Arrow batches logged to stdout.
 
 ### 3. (Optional) Try ADBC
 
-ADBC *can* work — but only if the server speaks full Flight SQL.
+ADBC now works for core query + prepared-statement flows.
 
-Porter does not.
-
-If you try anyway, you’ll hit errors like:
-
-```
-Parser Error: syntax error at or near "Ctype.googleapis.com/..."
+```bash
+go run ./example
 ```
 
-That’s the driver sending protobuf-encoded commands your server intentionally ignores.
+If your server binary is older, you may still see protobuf-ish parser errors.
+Restart with the latest build and those should disappear.
 
 ---
 
 ## 💡 Why This Design
 
-Because the “standard” stack looks like this:
+Because the “standard” stack often looks like this:
 
 ```
 SQL → protobuf → Flight SQL → driver manager → ADBC → DuckDB
 ```
 
-Porter collapses it to:
+Porter keeps the fast lane:
 
 ```
-SQL → Flight → DuckDB → Arrow
+SQL (raw or protobuf command) → Flight → DuckDB → Arrow
 ```
 
-Fewer layers. Fewer surprises. Faster iteration.
+Fewer mysteries. Fewer surprises. Faster iteration.
 
 ---
 
@@ -154,7 +143,7 @@ Fewer layers. Fewer surprises. Faster iteration.
 
 * [ ] Parameter binding via `DoPut`
 * [ ] Better session management
-* [ ] Optional strict Flight SQL compatibility layer
+* [ ] Expand Flight SQL coverage beyond core command + prepare/close flows
 * [ ] Benchmarks
 
 ---
