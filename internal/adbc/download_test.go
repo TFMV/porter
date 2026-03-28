@@ -39,7 +39,7 @@ func TestDownloadAndExtract(t *testing.T) {
 	tarData := createTestTar()
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Write(tarData)
+		_, _ = w.Write(tarData)
 	}))
 	defer srv.Close()
 

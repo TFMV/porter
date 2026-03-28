@@ -10,12 +10,13 @@ import (
 	"testing"
 	"time"
 
+	"github.com/TFMV/porter/execution/engine"
+	"github.com/TFMV/porter/testutil/arrowtest"
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/flight"
+	"github.com/apache/arrow-go/v18/arrow/memory"
 	"github.com/coder/websocket"
 	"github.com/coder/websocket/wsjson"
-
-	"github.com/TFMV/porter/testutil/arrowtest"
 )
 
 // ─────────────────────────────────────
@@ -50,8 +51,24 @@ func (f *fakeEngine) ReleaseQuerySlot() {
 	}
 }
 
-func (f *fakeEngine) BuildStream(ctx context.Context, sql string, params arrow.RecordBatch) (*arrow.Schema, <-chan flight.StreamChunk, error) {
+func (f *fakeEngine) BuildStream(ctx context.Context, sql string, params arrow.RecordBatch) (*arrow.Schema, <-chan engine.StreamChunk, error) {
 	return f.schema, f.ch, nil
+}
+
+func (f *fakeEngine) DeriveSchema(ctx context.Context, sql string) (*arrow.Schema, error) {
+	return f.schema, nil
+}
+
+func (f *fakeEngine) ExecuteUpdate(ctx context.Context, sql string) (int64, error) {
+	return 0, nil
+}
+
+func (f *fakeEngine) Allocator() memory.Allocator {
+	return memory.NewGoAllocator()
+}
+
+func (f *fakeEngine) Close() error {
+	return nil
 }
 
 // ─────────────────────────────────────

@@ -1,42 +1,40 @@
 <div align="center">
   <img src="assets/porter-logo.svg" alt="Porter Logo" width="140" height="140">
   <h1>Porter</h1>
-  <p>A streaming-first Arrow Flight SQL server for DuckDB — simple, sharp, and built for motion.</p>
+  <p>A streaming-first Arrow server for DuckDB — Flight SQL and WebSocket, simple and built for motion.</p>
 </div>
 
 ---
 
 ## 🧭 Overview
 
-Porter is a DuckDB-backed Arrow Flight SQL server designed around one idea:
+Porter is a DuckDB-backed Arrow server with two transport protocols:
+
+- **Flight SQL** — gRPC-based Arrow Flight SQL
+- **WebSocket** — HTTP-based Arrow streaming
 
 > SQL goes in. Arrow streams out. Everything else is detail.
 
-It sits directly on top of Apache Arrow Flight SQL and exposes a clean execution surface for both raw SQL and prepared statements.
-
-No orchestration layer. No distributed query engine. No abstraction sprawl.
-
-Just a tight execution loop between Flight and DuckDB.
+Both transports share the same execution engine, ensuring identical query semantics.
 
 ---
 
 ## ⚡ Key Characteristics
 
 * Streaming-first execution model (Arrow RecordBatch streams)
+* Dual transport support: Flight SQL + WebSocket
+* Shared execution engine for semantic parity
 * Native DuckDB execution via ADBC
 * Full prepared statement lifecycle with parameter binding
 * TTL-based handle management with background GC
-* Minimal, explicit Flight SQL surface area
 
 ---
 
-## 🧱 Architecture
-
-Porter keeps the control flow linear:
+## 🏗️ Architecture
 
 ```
            +-------------------+
-           |   Flight Client   |
+           |   Flight Client   |  <-- ADBC / Flight SQL
            +-------------------+
                      |
                gRPC / Flight
@@ -44,15 +42,12 @@ Porter keeps the control flow linear:
            +-------------------+
            |   Porter Server   |
            |-------------------|
-           | Flight SQL Layer  |
-           | Handle Manager    |
-           | Prepared Stmts    |
-           | Stream Engine     |
+           | Shared Engine     |  <-- BuildStream()
            +-------------------+
                      |
            +-------------------+
            |     DuckDB        |
-           |   (via ADBC)      |
+           |   (via ADBC)     |
            +-------------------+
                      |
            +-------------------+
@@ -67,7 +62,7 @@ DuckDB does the heavy lifting.
 
 ## 🚀 Getting Started
 
-You have three ways to run Porter depending on how you like to work:
+You have three ways to run Porter:
 
 * Docker (fastest path)
 * `go install` (clean local toolchain)
@@ -75,22 +70,23 @@ You have three ways to run Porter depending on how you like to work:
 
 ---
 
-### 🐳 Option 1 — Run with Docker (fastest)
+### 🐳 Option 1 — Run with Docker
 
 ```bash
 docker build -t porter .
-docker run -p 32010:32010 porter
+docker run -p 32010:32010 -p 8080:8080 porter --ws
 ```
 
 Run with a persistent database:
 
 ```bash
-docker run -p 32010:32010 -v $(pwd)/data:/data porter --db /data/porter.duckdb
+docker run -p 32010:32010 -p 8080:8080 -v $(pwd)/data:/data porter --db /data/porter.duckdb --ws
 ```
 
 Defaults:
 
-* Address: `0.0.0.0:32010`
+* Flight SQL: `0.0.0.0:32010`
+* WebSocket: `0.0.0.0:8080` (when `--ws` enabled)
 * Database: in-memory (`:memory:`)
 
 ---
@@ -152,17 +148,33 @@ go run ./cmd/porter serve
 
 ## 💻 CLI Usage
 
-Porter exposes a composable CLI:
-
 ```bash
 porter --help
 ```
 
-### Run the server
+### Quick Start
 
 ```bash
-porter serve --db :memory: --port 32010
+porter              # Start Flight SQL server on :32010
+porter serve        # Same as above
 ```
+
+### With WebSocket
+
+```bash
+porter --ws                        # Flight SQL + WebSocket
+porter serve --ws                   # Same as above
+porter serve --ws --ws-port 9090   # Custom WebSocket port
+```
+
+### Full Flags
+
+| Flag | Description | Default |
+|------|-------------|---------|
+| `--db` | DuckDB file path | `:memory:` |
+| `--port` | Flight SQL port | `32010` |
+| `--ws` | Enable WebSocket | `false` |
+| `--ws-port` | WebSocket port | `8080` |
 
 ### Execute a query
 
@@ -192,68 +204,73 @@ porter schema table_name
 
 * `PORTER_DB`
 * `PORTER_PORT`
-
----
-
-## 🧠 Execution Model
-
-Porter supports two execution paths:
-
-### 1. One-shot SQL
-
-* `GetFlightInfoStatement` → plan + handle
-* `DoGetStatement` → stream results
-
-### 2. Prepared Statements
-
-* `CreatePreparedStatement`
-* `DoPutPreparedStatementQuery`
-* `DoGetPreparedStatement`
-* `ClosePreparedStatement`
-
-Parameter batches are real Arrow RecordBatches with explicit ownership.
-
----
-
-## 🌊 Streaming Core
-
-```
-DuckDB → Arrow RecordReader → Channel → Flight StreamChunks
-```
-
-Backpressure is enforced naturally via the channel boundary.
+* `PORTER_WS`
+* `PORTER_WS_PORT`
 
 ---
 
 ## 🌐 Wire Contract
+
+### Flight SQL
 
 | Operation            | Behavior                            |
 | -------------------- | ----------------------------------- |
 | SQL Query            | Raw SQL → FlightInfo → DoGet stream |
 | Prepared Statements  | Handle-based execution with binding |
 | Schema Introspection | Lightweight probe execution         |
+| ExecuteUpdate        | DDL/DML via DoPutCommandStatementUpdate |
+
+### WebSocket
+
+Send JSON query request:
+
+```json
+{"query": "SELECT * FROM table"}
+```
+
+Receive:
+
+1. Schema message: `{"type": "schema", "fields": ["col1", "col2"]}`
+2. Binary IPC frames containing Arrow RecordBatches
+
+---
+
+## 🌊 Streaming Core
+
+Both transports use the same execution primitive:
+
+```go
+BuildStream(ctx, sql, params) (*arrow.Schema, <-chan StreamChunk, error)
+```
+
+```
+DuckDB → Arrow RecordReader → Channel → StreamChunk
+```
+
+Backpressure is enforced naturally via the channel boundary.
 
 ---
 
 ## 🛣️ Roadmap
 
-* [x] Streaming Flight SQL execution
-* [x] Prepared statements
-* [x] TTL-based lifecycle
-* [x] Background GC
-* [ ] WebSocket transport
-* [ ] Session context
-* [ ] Improved schema probing
-* [ ] Benchmark suite
+- [x] Streaming Flight SQL execution
+- [x] WebSocket transport
+- [x] Shared execution engine
+- [x] Prepared statements
+- [x] TTL-based lifecycle
+- [x] Background GC
+- [ ] Session context
+- [ ] Improved schema probing
+- [ ] Benchmark suite
 
 ---
 
 ## 🤝 Contributing
 
-If you’ve ever looked at a data system and thought:
+If you've ever looked at a data system and thought:
 
-> “Why is this so complicated?”
+> "Why is this so complicated?"
 
-You’re in the right place.
+You're in the right place.
 
 Build it smaller. Make it clearer. Keep it moving.

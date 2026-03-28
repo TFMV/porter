@@ -7,6 +7,7 @@ require (
 	github.com/apache/arrow-go/v18 v18.5.2
 	github.com/coder/websocket v1.8.14
 	github.com/duckdb/duckdb-go/v2 v2.10501.0
+	github.com/gorilla/websocket v1.5.3
 	github.com/spf13/cobra v1.10.2
 	github.com/spf13/viper v1.21.0
 	google.golang.org/grpc v1.79.3
