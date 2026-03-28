@@ -181,7 +181,7 @@ func drain(stream array.RecordReader) (int, int) {
 	defer stream.Release()
 	var rows, batches int
 	for stream.Next() {
-		rows += int(stream.Record().NumRows())
+		rows += int(stream.RecordBatch().NumRows())
 		batches++
 	}
 	if err := stream.Err(); err != nil {

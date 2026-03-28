@@ -34,16 +34,15 @@ func openDuckDBConnection(ctx context.Context, dbPath string) (adbc.Database, ad
 
 	var drv drivermgr.Driver
 
-	// IMPORTANT: use URI-style DSN for DuckDB persistence
-	dsn := "duckdb://:memory:"
+	params := map[string]string{
+		"driver": "duckdb",
+		"path":   dbPath,
+	}
 	if dbPath != ":memory:" {
-		dsn = fmt.Sprintf("duckdb://%s", dbPath)
+		params["access_mode"] = "read_write"
 	}
 
-	adb, err := drv.NewDatabase(map[string]string{
-		"driver": "duckdb",
-		"uri":    dsn,
-	})
+	adb, err := drv.NewDatabase(params)
 	if err != nil {
 		return nil, nil, fmt.Errorf("open duckdb %q: %w", dbPath, err)
 	}
