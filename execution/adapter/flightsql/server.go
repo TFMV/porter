@@ -9,6 +9,7 @@ import (
 	"io"
 	"log/slog"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/apache/arrow-adbc/go/adbc"
@@ -126,10 +127,13 @@ type Server struct {
 	preparedStmts      map[string]preparedEntry
 	handlesMu          sync.RWMutex
 
-	activeOps      sync.WaitGroup
+	// Query Lifecycle Tracking
+	activeOps       sync.WaitGroup
+	activeQueries   map[int64]context.CancelFunc
+	activeQueriesMu sync.Mutex
+	nextQueryID     int64
+
 	querySemaphore chan struct{}
-	shutdownCtx    context.Context
-	shutdownCancel context.CancelFunc
 
 	stopGC     chan struct{}
 	stopGCOnce sync.Once
@@ -206,13 +210,9 @@ func NewServer(cfg Config) (*Server, error) {
 		Logger:             logger,
 		queryHandles:       make(map[string]queryHandle),
 		preparedStmts:      make(map[string]preparedEntry),
+		activeQueries:      make(map[int64]context.CancelFunc),
 		stopGC:             make(chan struct{}),
-		shutdownCtx:        nil,
-		shutdownCancel:     nil,
 	}
-	shutdownCtx, shutdownCancel := context.WithCancel(context.Background())
-	srv.shutdownCtx = shutdownCtx
-	srv.shutdownCancel = shutdownCancel
 
 	if cfg.MaxConcurrentQueries > 0 {
 		srv.querySemaphore = make(chan struct{}, cfg.MaxConcurrentQueries)
@@ -222,32 +222,30 @@ func NewServer(cfg Config) (*Server, error) {
 	return srv, nil
 }
 
-func (s *Server) withShutdown(ctx context.Context) context.Context {
-	if s == nil || s.shutdownCtx == nil {
-		return ctx
-	}
+// ─── LIFECYCLE MANAGEMENT ─────────────────────────────────────────────────────
+
+// trackQuery provides explicit lifecycle tracking. It ensures:
+// 1. Every operation has a cancellable context.
+// 2. The cancellation is centrally registered for Shutdown.
+// 3. The WaitGroup prevents leaks of goroutines or native execution.
+func (s *Server) trackQuery(ctx context.Context) (context.Context, func()) {
 	ctx, cancel := context.WithCancel(ctx)
-	go func() {
-		select {
-		case <-ctx.Done():
-		case <-s.shutdownCtx.Done():
-			cancel()
-		}
-	}()
-	return ctx
-}
+	id := atomic.AddInt64(&s.nextQueryID, 1)
 
-type flightServerWithExchange struct {
-	flight.FlightServer
-	srv *Server
-}
+	s.activeQueriesMu.Lock()
+	s.activeQueries[id] = cancel
+	s.activeQueriesMu.Unlock()
 
-func (f *flightServerWithExchange) DoExchange(stream flight.FlightService_DoExchangeServer) error {
-	return f.srv.DoExchange(f.srv.withShutdown(stream.Context()), stream)
-}
+	s.activeOps.Add(1)
 
-func (s *Server) AsFlightServer() flight.FlightServer {
-	return &flightServerWithExchange{FlightServer: fsql.NewFlightServer(s), srv: s}
+	cleanup := func() {
+		s.activeQueriesMu.Lock()
+		delete(s.activeQueries, id)
+		s.activeQueriesMu.Unlock()
+		cancel()
+		s.activeOps.Done()
+	}
+	return ctx, cleanup
 }
 
 func (s *Server) Close() error {
@@ -255,20 +253,26 @@ func (s *Server) Close() error {
 }
 
 func (s *Server) Shutdown(ctx context.Context) error {
-	if s.shutdownCancel != nil {
-		s.shutdownCancel()
-	}
-
+	// 1. Set shutdown state for background tasks
 	s.stopGCOnce.Do(func() {
 		close(s.stopGC)
 	})
 
+	// 2. Cancel all active query contexts explicitly
+	s.activeQueriesMu.Lock()
+	for _, cancel := range s.activeQueries {
+		cancel()
+	}
+	s.activeQueriesMu.Unlock()
+
+	// 3. Wait for activeOps to drain
 	done := make(chan struct{})
 	go func() {
 		s.activeOps.Wait()
 		close(done)
 	}()
 
+	// 4. Apply timeout guard to prevent deadlock
 	select {
 	case <-done:
 		s.handlesMu.Lock()
@@ -281,7 +285,7 @@ func (s *Server) Shutdown(ctx context.Context) error {
 		s.handlesMu.Unlock()
 		return s.db.Close()
 	case <-ctx.Done():
-		return ctx.Err()
+		return fmt.Errorf("shutdown timeout: %w", ctx.Err())
 	}
 }
 
@@ -365,6 +369,10 @@ func preparedStatementTicket(handle []byte) ([]byte, error) {
 }
 
 func (s *Server) deriveSchema(ctx context.Context, sql string) (*arrow.Schema, error) {
+	// Explicit lifecycle tracking for the probe executing
+	ctx, finishQuery := s.trackQuery(ctx)
+	defer finishQuery()
+
 	start := time.Now()
 	probeCtx, cancel := context.WithTimeout(ctx, s.schemaProbeTimeout)
 	defer cancel()
@@ -408,9 +416,11 @@ func (s *Server) buildStream(
 	sql string,
 	params arrow.RecordBatch, // Caller hands ownership to this function
 ) (*arrow.Schema, <-chan flight.StreamChunk, error) {
-	ctx = s.withShutdown(ctx)
 
-	// Guarantee parameter release on all exit paths (early return or after streaming)
+	// Track explicit lifecycle for execution
+	ctx, finishQuery := s.trackQuery(ctx)
+
+	// Guarantee parameter release on all exit paths
 	cleanupParams := sync.Once{}
 	releaseParams := func() {
 		cleanupParams.Do(func() {
@@ -420,7 +430,6 @@ func (s *Server) buildStream(
 		})
 	}
 
-	// Enforce concurrency before any query execution begins.
 	slotReleased := false
 	releaseSlot := func() {
 		if slotReleased {
@@ -430,8 +439,15 @@ func (s *Server) buildStream(
 		s.releaseQuerySlot()
 	}
 
-	if err := s.acquireQuerySlot(ctx); err != nil {
+	// abort is used for early exits before background goroutine takes over
+	abort := func() {
 		releaseParams()
+		releaseSlot()
+		finishQuery()
+	}
+
+	if err := s.acquireQuerySlot(ctx); err != nil {
+		abort()
 		return nil, nil, err
 	}
 
@@ -441,24 +457,21 @@ func (s *Server) buildStream(
 
 	conn, err := s.db.Open(ctx)
 	if err != nil {
-		releaseParams()
-		releaseSlot()
+		abort()
 		return nil, nil, wrapInternal(err, "open db connection")
 	}
 
 	stmt, err := conn.NewStatement()
 	if err != nil {
 		conn.Close()
-		releaseParams()
-		releaseSlot()
+		abort()
 		return nil, nil, wrapInternal(err, "create statement")
 	}
 
 	if err := stmt.SetSqlQuery(sql); err != nil {
 		stmt.Close()
 		conn.Close()
-		releaseParams()
-		releaseSlot()
+		abort()
 		return nil, nil, ErrInvalidSQL
 	}
 
@@ -466,29 +479,26 @@ func (s *Server) buildStream(
 		if err := stmt.Prepare(ctx); err != nil {
 			stmt.Close()
 			conn.Close()
-			releaseParams()
-			releaseSlot()
+			abort()
 			return nil, nil, wrapInternal(err, "prepare statement")
 		}
 		if err := stmt.Bind(ctx, params); err != nil {
 			stmt.Close()
 			conn.Close()
-			releaseParams()
-			releaseSlot()
+			abort()
 			return nil, nil, wrapInternal(err, "bind parameters")
 		}
 	}
 
+	// Tracked ctx guarantees executing block aborts deterministically on shutdown.
 	reader, _, err := stmt.ExecuteQuery(ctx)
 	if err != nil {
 		stmt.Close()
 		conn.Close()
-		releaseParams()
-		releaseSlot()
+		abort()
 		return nil, nil, wrapInternal(err, "execute query")
 	}
 
-	s.activeOps.Add(1)
 	schema := reader.Schema()
 
 	// Unbuffered or minimal buffer ensures true backpressure against the Flight stream
@@ -502,7 +512,7 @@ func (s *Server) buildStream(
 			conn.Close()
 			releaseParams()
 			releaseSlot()
-			s.activeOps.Done()
+			finishQuery() // untracks operation & signals activeOps.Done()
 		})
 	}
 
@@ -520,14 +530,28 @@ func pumpRecordsSafely(
 	defer close(ch)
 	defer cleanup()
 
-	for reader.Next() {
-		// Strict cancellation check at write boundary
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+
+		ok := reader.Next()
+		if !ok {
+			break
+		}
+
 		if ctx.Err() != nil {
 			return
 		}
 
 		rec := reader.RecordBatch()
-		rec.Retain() // Retain for the channel; framework will release
+		if rec == nil {
+			continue
+		}
+
+		rec.Retain()
 
 		select {
 		case ch <- flight.StreamChunk{Data: rec}:
@@ -815,6 +839,10 @@ func (s *Server) DoPutCommandStatementUpdate(
 		return 0, ErrEmptyQuery
 	}
 
+	// Track operation lifecycle
+	ctx, finishQuery := s.trackQuery(ctx)
+	defer finishQuery()
+
 	conn, err := s.db.Open(ctx)
 	if err != nil {
 		return 0, wrapInternal(err, "open db connection")
@@ -861,8 +889,6 @@ func (s *Server) readFlightDataParameterBatch(firstMsg *flight.FlightData, strea
 	defer rdr.Release()
 
 	var params arrow.RecordBatch
-	// FlightSQL parameter payloads are typically a single batch. Retain only the first
-	// batch and release any additional batches to avoid accidental memory retention.
 	for rdr.Next() {
 		rec := rdr.RecordBatch()
 		if rec == nil {
@@ -920,8 +946,7 @@ func (s *Server) DoExchange(
 		return readErr
 	}
 
-	// We utilize buildStream to manage the ADBC lifecycle, but consume the channel immediately.
-	// Because the channel is size 1, this blocks DuckDB from overproducing data if the network is slow.
+	// buildStream will inherently track this execution through trackQuery
 	schema, ch, err := s.buildStream(ctx, sql, params)
 	if err != nil {
 		return err
@@ -935,7 +960,6 @@ func (s *Server) DoExchange(
 			return chunk.Err
 		}
 
-		// Direct, backpressure-sensitive write to the gRPC stream
 		if err := writer.Write(chunk.Data); err != nil {
 			chunk.Data.Release()
 			return wrapInternal(err, "write stream chunk")
@@ -948,4 +972,20 @@ func (s *Server) DoExchange(
 	}
 
 	return nil
+}
+
+type flightServerWithExchange struct {
+	flight.FlightServer
+	srv *Server
+}
+
+func (f *flightServerWithExchange) DoExchange(stream flight.FlightService_DoExchangeServer) error {
+	// Track the entire gRPC exchange lifecycle
+	ctx, cleanup := f.srv.trackQuery(stream.Context())
+	defer cleanup()
+	return f.srv.DoExchange(ctx, stream)
+}
+
+func (s *Server) AsFlightServer() flight.FlightServer {
+	return &flightServerWithExchange{FlightServer: fsql.NewFlightServer(s), srv: s}
 }
