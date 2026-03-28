@@ -67,99 +67,131 @@ DuckDB does the heavy lifting.
 
 ## 🚀 Getting Started
 
-### 0. Install DuckDB driver
+You have three ways to run Porter depending on how you like to work:
 
-Before anything else:
+* Docker (fastest path)
+* `go install` (clean local toolchain)
+* Build from source (full control)
+
+---
+
+### 🐳 Option 1 — Run with Docker (fastest)
+
+```bash
+docker build -t porter .
+docker run -p 32010:32010 porter
+```
+
+Run with a persistent database:
+
+```bash
+docker run -p 32010:32010 -v $(pwd)/data:/data porter --db /data/porter.duckdb
+```
+
+Defaults:
+
+* Address: `0.0.0.0:32010`
+* Database: in-memory (`:memory:`)
+
+---
+
+### ⚙️ Option 2 — Install via `go install`
+
+#### 1. Install Porter
+
+```bash
+go install github.com/TFMV/porter/cmd/porter@latest
+```
+
+This installs `porter` into your `$GOBIN`.
+
+#### 2. Install ADBC CLI (dbc)
+
+```bash
+curl -LsSf https://dbc.columnar.tech/install.sh | sh
+```
+
+#### 3. Install DuckDB ADBC driver
+
+```bash
+dbc install duckdb
+```
+
+Verify installation:
+
+```bash
+dbc list
+```
+
+You should see `duckdb` listed.
+
+---
+
+### 🛠 Option 3 — Build from Source
+
+#### 1. Clone
+
+```bash
+git clone https://github.com/TFMV/porter.git
+cd porter
+```
+
+#### 2. Install DuckDB ADBC driver
 
 ```bash
 ./install_duckdb.sh
 ```
 
-This sets up the required DuckDB ADBC driver environment.
-
----
-
-### 1. Run the Server
+#### 3. Run
 
 ```bash
-go run ./cmd/server
+go run ./cmd/porter serve
 ```
-
-Defaults:
-
-* Address: `localhost:32010`
-* Database: in-memory DuckDB (`:memory:`)
-
----
-
-### 2. Run a Client
-
-You have two ways to exercise the system:
-
-#### Native client
-
-```bash
-go run ./cmd/client
-```
-
-#### Example harness
-
-```bash
-go run ./example
-```
-
-Both will issue queries and stream Arrow record batches back from Flight.
 
 ---
 
 ## 💻 CLI Usage
 
-Porter also exposes a developer-facing CLI under `cmd/porter`. The built CLI is a small, composable tool for local workflows.
-
-### Build and use the Porter CLI
+Porter exposes a composable CLI:
 
 ```bash
-go build -o porter ./cmd/porter
-./porter --help
+porter --help
 ```
 
 ### Run the server
 
-The default action is `serve`, so `./porter` behaves the same as `./porter serve`.
-
 ```bash
-./porter serve --db :memory: --port 32010
-# or simply
-./porter --db :memory: --port 32010
+porter serve --db :memory: --port 32010
 ```
 
-### Execute a single query
+### Execute a query
 
 ```bash
-./porter query "SELECT 1 AS value"
+porter query "SELECT 1 AS value"
 ```
 
-### Start an interactive REPL
+### REPL
 
 ```bash
-./porter repl
+porter repl
 ```
 
-### Load Parquet data
+### Load Parquet
 
 ```bash
-./porter load data.parquet
+porter load data.parquet
 ```
 
-### Inspect a table schema
+### Inspect schema
 
 ```bash
-./porter schema table_name
+porter schema table_name
 ```
 
 ### Environment variables
 
-`PORTER_DB` and `PORTER_PORT` are supported as alternate configuration sources.
+* `PORTER_DB`
+* `PORTER_PORT`
 
 ---
 
@@ -172,51 +204,28 @@ Porter supports two execution paths:
 * `GetFlightInfoStatement` → plan + handle
 * `DoGetStatement` → stream results
 
-Ephemeral handles, auto-expire under TTL.
-
----
-
 ### 2. Prepared Statements
 
-* `CreatePreparedStatement` → persistent handle
-* `DoPutPreparedStatementQuery` → bind parameters
-* `DoGetPreparedStatement` → execute + stream
-* `ClosePreparedStatement` → cleanup
+* `CreatePreparedStatement`
+* `DoPutPreparedStatementQuery`
+* `DoGetPreparedStatement`
+* `ClosePreparedStatement`
 
-Parameter batches are real Arrow RecordBatches, reference-counted and safely transferred across execution boundaries.
-
----
-
-## 🧬 Design Rules
-
-Porter is built on strict invariants:
-
-* Flight SQL owns protocol routing (via `fsql.NewFlightServer`)
-* Porter only implements execution semantics
-* Handles are in-memory and TTL-bound
-* GC runs in the background (no inline eviction logic)
-* Arrow memory is explicitly retained/released
-
-Nothing implicit. Nothing magical.
+Parameter batches are real Arrow RecordBatches with explicit ownership.
 
 ---
 
 ## 🌊 Streaming Core
 
-All query results flow through a single pattern:
-
 ```
 DuckDB → Arrow RecordReader → Channel → Flight StreamChunks
 ```
 
-Records are retained per batch and released after network write completion.
-This keeps backpressure and memory usage predictable.
+Backpressure is enforced naturally via the channel boundary.
 
 ---
 
 ## 🌐 Wire Contract
-
-Porter supports both raw and Flight SQL-native flows:
 
 | Operation            | Behavior                            |
 | -------------------- | ----------------------------------- |
@@ -224,45 +233,18 @@ Porter supports both raw and Flight SQL-native flows:
 | Prepared Statements  | Handle-based execution with binding |
 | Schema Introspection | Lightweight probe execution         |
 
-Both converge on the same execution engine.
-
----
-
-## 🔌 WebSockets (Coming Soon)
-
-A WebSocket transport layer is in progress.
-
-Planned capabilities:
-
-* Bi-directional streaming query sessions
-* Low-latency Arrow batch push over WS frames
-* Browser-native Flight-like client
-* Session-based prepared statement lifecycle
-
-Think of it as Flight SQL without the gRPC boundary.
-
 ---
 
 ## 🛣️ Roadmap
 
 * [x] Streaming Flight SQL execution
-* [x] Prepared statements with parameter binding
-* [x] TTL-based handle lifecycle
-* [x] Background garbage collection
-* [ ] WebSocket transport layer
-* [ ] Session-aware execution context
-* [ ] Improved schema introspection (reduce probe execution)
-* [ ] Performance benchmarking suite
-
----
-
-## 🧪 Philosophy
-
-Porter is intentionally narrow:
-
-> No distributed illusions. No unnecessary abstraction layers. Just a fast path from query to stream.
-
-It is a system designed for hacking, embedding, and evolving.
+* [x] Prepared statements
+* [x] TTL-based lifecycle
+* [x] Background GC
+* [ ] WebSocket transport
+* [ ] Session context
+* [ ] Improved schema probing
+* [ ] Benchmark suite
 
 ---
 
@@ -272,6 +254,6 @@ If you’ve ever looked at a data system and thought:
 
 > “Why is this so complicated?”
 
-you already understand what Porter is trying to fix.
+You’re in the right place.
 
 Build it smaller. Make it clearer. Keep it moving.
