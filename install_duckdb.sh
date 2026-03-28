@@ -1,30 +1,73 @@
-#!/usr/bin/env bash
+# =========================
+# BUILD STAGE
+# =========================
+FROM golang:1.26-bookworm AS build
 
-set -euo pipefail
+WORKDIR /app
 
-INSTALL_URL="https://dbc.columnar.tech/install.sh"
-TARGET_DRIVER="duckdb"
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    gcc \
+    g++ \
+    libc6-dev \
+    pkg-config \
+    git \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
 
-echo "==> Installing dbc from Columnar..."
+COPY go.mod go.sum ./
+RUN go mod download
 
-# Check for curl
-if ! command -v curl >/dev/null 2>&1; then
-  echo "Error: curl is required but not installed." >&2
-  exit 1
-fi
+COPY . .
 
-# Install dbc
-curl -LsSf "$INSTALL_URL" | sh
+# Force CGO ON for DuckDB Go bindings
+ENV CGO_ENABLED=1
 
-# Verify dbc exists
-if ! command -v dbc >/dev/null 2>&1; then
-  echo "Error: dbc installation failed (binary not found in PATH)." >&2
-  exit 1
-fi
+RUN go build -o porter ./cmd/porter
 
-echo "==> Installing driver: $TARGET_DRIVER"
-dbc install "$TARGET_DRIVER"
 
-echo "==> Done."
-echo "Installed drivers:"
-dbc list || true
+# =========================
+# RUNTIME STAGE
+# =========================
+FROM debian:bookworm-slim
+
+WORKDIR /app
+
+RUN apt-get update && apt-get install -y \
+    ca-certificates \
+    libstdc++6 \
+    libgcc-s1 \
+    && rm -rf /var/lib/apt/lists/*
+
+
+# =========================
+# OPTIONAL: DEBUG TOOLS (remove in prod if desired)
+# =========================
+RUN apt-get update && apt-get install -y \
+    bash \
+    curl \
+    file \
+    && rm -rf /var/lib/apt/lists/*
+
+
+# =========================
+# SYSTEM CONFIG
+# =========================
+ENV GODEBUG=cgocheck=0
+
+# IMPORTANT: no external DuckDB libs
+# DuckDB is embedded via Go binding
+
+
+# =========================
+# COPY BINARY
+# =========================
+COPY --from=build /app/porter /usr/local/bin/porter
+
+
+# =========================
+# RUNTIME CONFIG
+# =========================
+EXPOSE 32010
+
+ENTRYPOINT ["porter"]
