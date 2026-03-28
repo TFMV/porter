@@ -5,6 +5,7 @@ go 1.26.1
 require (
 	github.com/apache/arrow-adbc/go/adbc v1.10.0
 	github.com/apache/arrow-go/v18 v18.5.2
+	github.com/coder/websocket v1.8.14
 	github.com/duckdb/duckdb-go/v2 v2.10501.0
 	github.com/spf13/cobra v1.10.2
 	github.com/spf13/viper v1.21.0
