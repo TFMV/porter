@@ -14,26 +14,45 @@ import (
 	"google.golang.org/grpc"
 )
 
+var (
+	dbPath string
+	port   int
+)
+
 var serveCmd = &cobra.Command{
 	Use:   "serve",
 	Short: "Start a standalone Porter FlightSQL server",
 	Long:  "Start a FlightSQL server backed by DuckDB and keep it running until interrupted.",
 	Args:  cobra.NoArgs,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		return runServe(loadConfig())
+		cfg := porterConfig{
+			DBPath: dbPath,
+			Port:   port,
+		}
+		return runServe(cfg)
 	},
+}
+
+func init() {
+	serveCmd.Flags().StringVar(&dbPath, "db", "", "DuckDB file path (use :memory: for in-memory)")
+	serveCmd.Flags().IntVar(&port, "port", 32010, "Port to run FlightSQL server on")
 }
 
 func runServe(cfg porterConfig) error {
 	cfg.DBPath = normalizeDBPath(cfg.DBPath)
 	addr := fmt.Sprintf(":%d", cfg.Port)
 
+	fmt.Printf("Starting Porter FlightSQL server on %s with DuckDB database at %q\n", addr, cfg.DBPath)
+
 	lis, err := net.Listen("tcp", addr)
 	if err != nil {
 		return fmt.Errorf("listen %s: %w", addr, err)
 	}
 
-	srv, err := flightsql.NewServer(flightsql.Config{DBPath: cfg.DBPath, Port: cfg.Port})
+	srv, err := flightsql.NewServer(flightsql.Config{
+		DBPath: cfg.DBPath,
+		Port:   cfg.Port,
+	})
 	if err != nil {
 		return fmt.Errorf("initialize server: %w", err)
 	}

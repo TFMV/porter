@@ -31,10 +31,18 @@ func normalizeDBPath(path string) string {
 
 func openDuckDBConnection(ctx context.Context, dbPath string) (adbc.Database, adbc.Connection, error) {
 	dbPath = normalizeDBPath(dbPath)
+
 	var drv drivermgr.Driver
+
+	// IMPORTANT: use URI-style DSN for DuckDB persistence
+	dsn := "duckdb://:memory:"
+	if dbPath != ":memory:" {
+		dsn = fmt.Sprintf("duckdb://%s", dbPath)
+	}
+
 	adb, err := drv.NewDatabase(map[string]string{
 		"driver": "duckdb",
-		"path":   dbPath,
+		"uri":    dsn,
 	})
 	if err != nil {
 		return nil, nil, fmt.Errorf("open duckdb %q: %w", dbPath, err)

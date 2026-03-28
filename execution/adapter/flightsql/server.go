@@ -104,19 +104,33 @@ type Config struct {
 	Port   int
 }
 
-// NewServer opens a DuckDB database at dbPath ("" or ":memory:" for in-memory)
-// and starts a background goroutine that evicts expired handles.
 func NewServer(cfg Config) (*Server, error) {
-	if cfg.DBPath == "" {
-		cfg.DBPath = ":memory:"
-	}
+
 	drv := drivermgr.Driver{}
-	db, err := drv.NewDatabase(map[string]string{
+
+	dbPath := cfg.DBPath
+	if dbPath == "" {
+		dbPath = ":memory:"
+	}
+
+	fmt.Printf("initializing DuckDB database at %q\n", dbPath)
+
+	// IMPORTANT:
+	// DuckDB ADBC driver via drivermgr expects "path", not "database"
+	// when using map-based configuration.
+	params := map[string]string{
 		"driver": "duckdb",
-		"path":   cfg.DBPath,
-	})
+		"path":   dbPath,
+	}
+
+	// Extra safety: some builds require explicit access mode
+	if dbPath != ":memory:" {
+		params["access_mode"] = "read_write"
+	}
+
+	db, err := drv.NewDatabase(params)
 	if err != nil {
-		return nil, fmt.Errorf("open duckdb %q: %w", cfg.DBPath, err)
+		return nil, fmt.Errorf("open duckdb %q: %w", dbPath, err)
 	}
 
 	srv := &Server{
@@ -126,7 +140,8 @@ func NewServer(cfg Config) (*Server, error) {
 		preparedStmts: make(map[string]preparedEntry),
 		stopGC:        make(chan struct{}),
 	}
-	srv.Alloc = memory.NewGoAllocator() // field on fsql.BaseServer
+
+	srv.Alloc = memory.NewGoAllocator()
 
 	go srv.runGC()
 	return srv, nil
