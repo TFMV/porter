@@ -51,8 +51,8 @@ func runServe(cfg porterConfig) error {
 
 	srv, err := flightsql.NewServer(flightsql.Config{
 		DBPath: cfg.DBPath,
-		Port:   cfg.Port,
 	})
+
 	if err != nil {
 		return fmt.Errorf("initialize server: %w", err)
 	}
