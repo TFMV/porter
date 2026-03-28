@@ -10,7 +10,6 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/array"
 	"github.com/apache/arrow-go/v18/arrow/flight"
 	"github.com/apache/arrow-go/v18/arrow/memory"
-	"go.uber.org/zap"
 )
 
 type fakeMessageReader struct {
@@ -156,7 +155,6 @@ func TestDoGetPreparedStatementWithNilParams(t *testing.T) {
 		t.Fatal(err)
 	}
 	s.preparedStmts[handle] = preparedEntry{sql: "SELECT 1", expires: time.Now().Add(time.Minute)}
-	s.zapLogger = zap.NewNop()
 
 	schema, ch, err := s.DoGetPreparedStatement(context.Background(), testPreparedStatementQuery{handle: []byte(handle)})
 	if err != nil {
