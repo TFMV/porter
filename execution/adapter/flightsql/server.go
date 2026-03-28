@@ -7,7 +7,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"sync"
 	"time"
 
@@ -27,8 +27,10 @@ import (
 )
 
 const (
-	defaultHandleTTL = 30 * time.Minute
-	gcInterval       = 5 * time.Minute
+	handleSize                = 16
+	defaultHandleTTL          = 30 * time.Minute
+	defaultGCInterval         = 5 * time.Minute
+	defaultSchemaProbeTimeout = 5 * time.Second
 )
 
 // ─── ERROR TAXONOMY ───────────────────────────────────────────────────────────
@@ -59,7 +61,8 @@ type BatchGuard struct {
 }
 
 func NewBatchGuard(b arrow.RecordBatch) *BatchGuard {
-	// We do NOT retain here; we assume the caller passes ownership to the guard.
+	// Caller must transfer ownership to the guard. Do not Release the batch after
+	// calling NewBatchGuard; the guard is responsible for releasing it exactly once.
 	return &BatchGuard{batch: b}
 }
 
@@ -113,21 +116,32 @@ func (e preparedEntry) isExpired() bool { return time.Now().After(e.expires) }
 type Server struct {
 	fsql.BaseServer
 
-	db        adbc.Database
-	handleTTL time.Duration
-	Alloc     memory.Allocator
+	db                 adbc.Database
+	handleTTL          time.Duration
+	schemaProbeTimeout time.Duration
+	Alloc              memory.Allocator
+	Logger             *slog.Logger
+	gcInterval         time.Duration
+	queryHandles       map[string]queryHandle
+	preparedStmts      map[string]preparedEntry
+	handlesMu          sync.RWMutex
 
-	queryHandles   map[string]queryHandle
-	queryHandlesMu sync.Mutex
+	activeOps      sync.WaitGroup
+	querySemaphore chan struct{}
 
-	preparedStmts   map[string]preparedEntry
-	preparedStmtsMu sync.Mutex
-
-	stopGC chan struct{}
+	stopGC     chan struct{}
+	stopGCOnce sync.Once
 }
 
 type Config struct {
-	DBPath string
+	DBPath               string
+	HandleTTL            time.Duration
+	GCInterval           time.Duration
+	SchemaProbeTimeout   time.Duration
+	MaxConcurrentQueries int
+	ReadOnly             bool
+	Logger               *slog.Logger
+	DevMode              bool
 }
 
 func NewServer(cfg Config) (*Server, error) {
@@ -137,14 +151,23 @@ func NewServer(cfg Config) (*Server, error) {
 		dbPath = ":memory:"
 	}
 
-	log.Printf("initializing DuckDB database at %q\n", dbPath)
+	logger := cfg.Logger
+	if logger == nil {
+		logger = slog.Default()
+	}
+
+	logger.Debug("initializing DuckDB database", slog.String("dbPath", dbPath), slog.Bool("readOnly", cfg.ReadOnly))
 
 	params := map[string]string{
 		"driver": "duckdb",
 		"path":   dbPath,
 	}
 	if dbPath != ":memory:" {
-		params["access_mode"] = "read_write"
+		if cfg.ReadOnly {
+			params["access_mode"] = "read_only"
+		} else {
+			params["access_mode"] = "read_write"
+		}
 	}
 
 	db, err := drv.NewDatabase(params)
@@ -152,13 +175,40 @@ func NewServer(cfg Config) (*Server, error) {
 		return nil, fmt.Errorf("open duckdb %q: %w", dbPath, err)
 	}
 
+	var alloc memory.Allocator = memory.NewGoAllocator()
+	if cfg.DevMode {
+		alloc = memory.NewCheckedAllocator(memory.NewGoAllocator())
+	}
+
+	handleTTL := cfg.HandleTTL
+	if handleTTL == 0 {
+		handleTTL = defaultHandleTTL
+	}
+
+	gcInterval := cfg.GCInterval
+	if gcInterval == 0 {
+		gcInterval = defaultGCInterval
+	}
+
+	schemaProbeTimeout := cfg.SchemaProbeTimeout
+	if schemaProbeTimeout == 0 {
+		schemaProbeTimeout = defaultSchemaProbeTimeout
+	}
+
 	srv := &Server{
-		db:            db,
-		handleTTL:     defaultHandleTTL,
-		Alloc:         memory.NewGoAllocator(),
-		queryHandles:  make(map[string]queryHandle),
-		preparedStmts: make(map[string]preparedEntry),
-		stopGC:        make(chan struct{}),
+		db:                 db,
+		handleTTL:          handleTTL,
+		gcInterval:         gcInterval,
+		schemaProbeTimeout: schemaProbeTimeout,
+		Alloc:              alloc,
+		Logger:             logger,
+		queryHandles:       make(map[string]queryHandle),
+		preparedStmts:      make(map[string]preparedEntry),
+		stopGC:             make(chan struct{}),
+	}
+
+	if cfg.MaxConcurrentQueries > 0 {
+		srv.querySemaphore = make(chan struct{}, cfg.MaxConcurrentQueries)
 	}
 
 	go srv.runGC()
@@ -179,22 +229,40 @@ func (s *Server) AsFlightServer() flight.FlightServer {
 }
 
 func (s *Server) Close() error {
-	close(s.stopGC)
+	return s.Shutdown(context.Background())
+}
 
-	s.preparedStmtsMu.Lock()
-	for _, e := range s.preparedStmts {
-		e.paramGuard.Release()
+func (s *Server) Shutdown(ctx context.Context) error {
+	s.stopGCOnce.Do(func() {
+		close(s.stopGC)
+	})
+
+	done := make(chan struct{})
+	go func() {
+		s.activeOps.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		s.handlesMu.Lock()
+		for _, e := range s.preparedStmts {
+			if e.paramGuard != nil {
+				e.paramGuard.Release()
+			}
+		}
+		s.preparedStmts = nil
+		s.handlesMu.Unlock()
+		return s.db.Close()
+	case <-ctx.Done():
+		return ctx.Err()
 	}
-	s.preparedStmts = nil
-	s.preparedStmtsMu.Unlock()
-
-	return s.db.Close()
 }
 
 // ─── GC & EVICTION ────────────────────────────────────────────────────────────
 
 func (s *Server) runGC() {
-	t := time.NewTicker(gcInterval)
+	t := time.NewTicker(s.gcInterval)
 	defer t.Stop()
 	for {
 		select {
@@ -207,16 +275,14 @@ func (s *Server) runGC() {
 }
 
 func (s *Server) evict() {
-	s.queryHandlesMu.Lock()
+	s.handlesMu.Lock()
 	for k, h := range s.queryHandles {
 		if h.isExpired() {
 			delete(s.queryHandles, k)
 		}
 	}
-	s.queryHandlesMu.Unlock()
 
 	var guardsToRelease []*BatchGuard
-	s.preparedStmtsMu.Lock()
 	for k, e := range s.preparedStmts {
 		if e.isExpired() {
 			if e.paramGuard != nil {
@@ -225,12 +291,32 @@ func (s *Server) evict() {
 			delete(s.preparedStmts, k)
 		}
 	}
-	s.preparedStmtsMu.Unlock()
+
+	s.handlesMu.Unlock()
 
 	// Release outside the lock to prevent blocking active queries
 	for _, g := range guardsToRelease {
 		g.Release()
 	}
+}
+
+func (s *Server) acquireQuerySlot(ctx context.Context) error {
+	if s.querySemaphore == nil {
+		return nil
+	}
+	select {
+	case s.querySemaphore <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (s *Server) releaseQuerySlot() {
+	if s.querySemaphore == nil {
+		return
+	}
+	<-s.querySemaphore
 }
 
 // ─── UTILS ────────────────────────────────────────────────────────────────────
@@ -253,7 +339,10 @@ func preparedStatementTicket(handle []byte) ([]byte, error) {
 }
 
 func (s *Server) deriveSchema(ctx context.Context, sql string) (*arrow.Schema, error) {
-	conn, err := s.db.Open(ctx)
+	probeCtx, cancel := context.WithTimeout(ctx, s.schemaProbeTimeout)
+	defer cancel()
+
+	conn, err := s.db.Open(probeCtx)
 	if err != nil {
 		return nil, wrapInternal(err, "failed to open adbc connection")
 	}
@@ -270,7 +359,7 @@ func (s *Server) deriveSchema(ctx context.Context, sql string) (*arrow.Schema, e
 		return nil, status.Errorf(codes.InvalidArgument, "invalid sql for schema derivation: %v", err)
 	}
 
-	reader, _, err := stmt.ExecuteQuery(ctx)
+	reader, _, err := stmt.ExecuteQuery(probeCtx)
 	if err != nil {
 		return nil, wrapInternal(err, "failed to execute schema probe")
 	}
@@ -342,6 +431,16 @@ func (s *Server) buildStream(
 		return nil, nil, wrapInternal(err, "execute query")
 	}
 
+	if err := s.acquireQuerySlot(ctx); err != nil {
+		reader.Release()
+		stmt.Close()
+		conn.Close()
+		releaseParams()
+		return nil, nil, wrapInternal(err, "acquire query slot")
+	}
+
+	s.activeOps.Add(1)
+
 	schema := reader.Schema()
 
 	// Unbuffered or minimal buffer ensures true backpressure against the Flight stream
@@ -354,6 +453,8 @@ func (s *Server) buildStream(
 			stmt.Close()
 			conn.Close()
 			releaseParams()
+			s.releaseQuerySlot()
+			s.activeOps.Done()
 		})
 	}
 
@@ -418,9 +519,9 @@ func (s *Server) GetFlightInfoStatement(
 		return nil, err
 	}
 
-	s.queryHandlesMu.Lock()
+	s.handlesMu.Lock()
 	s.queryHandles[handle] = queryHandle{sql: sql, expires: time.Now().Add(s.handleTTL)}
-	s.queryHandlesMu.Unlock()
+	s.handlesMu.Unlock()
 
 	ticketBytes, err := fsql.CreateStatementQueryTicket([]byte(handle))
 	if err != nil {
@@ -458,12 +559,12 @@ func (s *Server) DoGetStatement(
 ) (*arrow.Schema, <-chan flight.StreamChunk, error) {
 	handle := string(ticket.GetStatementHandle())
 
-	s.queryHandlesMu.Lock()
+	s.handlesMu.Lock()
 	h, ok := s.queryHandles[handle]
 	if ok {
 		delete(s.queryHandles, handle)
 	}
-	s.queryHandlesMu.Unlock()
+	s.handlesMu.Unlock()
 
 	if !ok || h.isExpired() {
 		return nil, nil, ErrNotFound
@@ -488,12 +589,12 @@ func (s *Server) CreatePreparedStatement(
 		return fsql.ActionCreatePreparedStatementResult{}, err
 	}
 
-	s.preparedStmtsMu.Lock()
+	s.handlesMu.Lock()
 	s.preparedStmts[handle] = preparedEntry{
 		sql:     sql,
 		expires: time.Now().Add(s.handleTTL),
 	}
-	s.preparedStmtsMu.Unlock()
+	s.handlesMu.Unlock()
 
 	return fsql.ActionCreatePreparedStatementResult{Handle: []byte(handle)}, nil
 }
@@ -504,12 +605,12 @@ func (s *Server) ClosePreparedStatement(
 ) error {
 	handle := string(req.GetPreparedStatementHandle())
 
-	s.preparedStmtsMu.Lock()
+	s.handlesMu.Lock()
 	e, ok := s.preparedStmts[handle]
 	if ok {
 		delete(s.preparedStmts, handle)
 	}
-	s.preparedStmtsMu.Unlock()
+	s.handlesMu.Unlock()
 
 	if ok && e.paramGuard != nil {
 		e.paramGuard.Release()
@@ -524,13 +625,13 @@ func (s *Server) GetFlightInfoPreparedStatement(
 ) (*flight.FlightInfo, error) {
 	handle := string(cmd.GetPreparedStatementHandle())
 
-	s.preparedStmtsMu.Lock()
+	s.handlesMu.Lock()
 	e, ok := s.preparedStmts[handle]
 	if ok {
 		e.expires = time.Now().Add(s.handleTTL)
 		s.preparedStmts[handle] = e
 	}
-	s.preparedStmtsMu.Unlock()
+	s.handlesMu.Unlock()
 
 	if !ok {
 		return nil, ErrNotFound
@@ -556,9 +657,9 @@ func (s *Server) GetSchemaPreparedStatement(
 ) (*flight.SchemaResult, error) {
 	handle := string(cmd.GetPreparedStatementHandle())
 
-	s.preparedStmtsMu.Lock()
+	s.handlesMu.RLock()
 	e, ok := s.preparedStmts[handle]
-	s.preparedStmtsMu.Unlock()
+	s.handlesMu.RUnlock()
 
 	if !ok {
 		return nil, ErrNotFound
@@ -582,20 +683,25 @@ func (s *Server) DoPutPreparedStatementQuery(
 	var newBatch arrow.RecordBatch
 	if reader.Next() {
 		rec := reader.RecordBatch()
-		rec.Retain()
-		newBatch = rec
+		if rec != nil {
+			rec.Retain()
+			newBatch = rec
+		}
 	}
 
-	s.preparedStmtsMu.Lock()
+	s.handlesMu.Lock()
 	e, ok := s.preparedStmts[handle]
 	var oldGuard *BatchGuard
 	if ok {
 		oldGuard = e.paramGuard
-		e.paramGuard = NewBatchGuard(newBatch) // Transfers ownership to the guard
+		if newBatch != nil {
+			e.paramGuard = NewBatchGuard(newBatch) // Transfers ownership to the guard
+			newBatch = nil
+		}
 		e.expires = time.Now().Add(s.handleTTL)
 		s.preparedStmts[handle] = e
 	}
-	s.preparedStmtsMu.Unlock()
+	s.handlesMu.Unlock()
 
 	if !ok {
 		if newBatch != nil {
@@ -616,7 +722,7 @@ func (s *Server) DoGetPreparedStatement(
 ) (*arrow.Schema, <-chan flight.StreamChunk, error) {
 	handle := string(cmd.GetPreparedStatementHandle())
 
-	s.preparedStmtsMu.Lock()
+	s.handlesMu.Lock()
 	e, ok := s.preparedStmts[handle]
 	var boundParams arrow.RecordBatch
 	if ok {
@@ -624,7 +730,7 @@ func (s *Server) DoGetPreparedStatement(
 		e.expires = time.Now().Add(s.handleTTL)
 		s.preparedStmts[handle] = e
 	}
-	s.preparedStmtsMu.Unlock()
+	s.handlesMu.Unlock()
 
 	if !ok {
 		return nil, nil, ErrNotFound
@@ -688,6 +794,8 @@ func (s *Server) readFlightDataParameterBatch(firstMsg *flight.FlightData, strea
 	defer rdr.Release()
 
 	var params arrow.RecordBatch
+	// FlightSQL parameter payloads are typically a single batch. Retain only the first
+	// batch and release any additional batches to avoid accidental memory retention.
 	for rdr.Next() {
 		rec := rdr.RecordBatch()
 		if rec == nil {
