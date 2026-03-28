@@ -20,6 +20,7 @@ import (
 	pb "github.com/apache/arrow-go/v18/arrow/flight/gen/flight"
 	"github.com/apache/arrow-go/v18/arrow/ipc"
 	"github.com/apache/arrow-go/v18/arrow/memory"
+	"go.uber.org/zap"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
@@ -121,6 +122,7 @@ type Server struct {
 	schemaProbeTimeout time.Duration
 	Alloc              memory.Allocator
 	Logger             *slog.Logger
+	zapLogger          *zap.Logger
 	gcInterval         time.Duration
 	queryHandles       map[string]queryHandle
 	preparedStmts      map[string]preparedEntry
@@ -180,6 +182,16 @@ func NewServer(cfg Config) (*Server, error) {
 		alloc = memory.NewCheckedAllocator(memory.NewGoAllocator())
 	}
 
+	var zapLogger *zap.Logger
+	if cfg.DevMode {
+		zapLogger, err = zap.NewDevelopment()
+	} else {
+		zapLogger, err = zap.NewProduction()
+	}
+	if err != nil {
+		return nil, fmt.Errorf("initialize logger: %w", err)
+	}
+
 	handleTTL := cfg.HandleTTL
 	if handleTTL == 0 {
 		handleTTL = defaultHandleTTL
@@ -202,6 +214,7 @@ func NewServer(cfg Config) (*Server, error) {
 		schemaProbeTimeout: schemaProbeTimeout,
 		Alloc:              alloc,
 		Logger:             logger,
+		zapLogger:          zapLogger,
 		queryHandles:       make(map[string]queryHandle),
 		preparedStmts:      make(map[string]preparedEntry),
 		stopGC:             make(chan struct{}),
@@ -388,9 +401,29 @@ func (s *Server) buildStream(
 		})
 	}
 
+	// Enforce concurrency before any query execution begins.
+	slotReleased := false
+	releaseSlot := func() {
+		if slotReleased {
+			return
+		}
+		slotReleased = true
+		s.releaseQuerySlot()
+	}
+
+	if err := s.acquireQuerySlot(ctx); err != nil {
+		releaseParams()
+		return nil, nil, err
+	}
+
+	if s.zapLogger != nil {
+		s.zapLogger.Debug("query slot acquired before execution", zap.String("sql", sql), zap.Bool("hasParams", params != nil))
+	}
+
 	conn, err := s.db.Open(ctx)
 	if err != nil {
 		releaseParams()
+		releaseSlot()
 		return nil, nil, wrapInternal(err, "open db connection")
 	}
 
@@ -398,6 +431,7 @@ func (s *Server) buildStream(
 	if err != nil {
 		conn.Close()
 		releaseParams()
+		releaseSlot()
 		return nil, nil, wrapInternal(err, "create statement")
 	}
 
@@ -405,6 +439,7 @@ func (s *Server) buildStream(
 		stmt.Close()
 		conn.Close()
 		releaseParams()
+		releaseSlot()
 		return nil, nil, ErrInvalidSQL
 	}
 
@@ -413,12 +448,14 @@ func (s *Server) buildStream(
 			stmt.Close()
 			conn.Close()
 			releaseParams()
+			releaseSlot()
 			return nil, nil, wrapInternal(err, "prepare statement")
 		}
 		if err := stmt.Bind(ctx, params); err != nil {
 			stmt.Close()
 			conn.Close()
 			releaseParams()
+			releaseSlot()
 			return nil, nil, wrapInternal(err, "bind parameters")
 		}
 	}
@@ -428,19 +465,11 @@ func (s *Server) buildStream(
 		stmt.Close()
 		conn.Close()
 		releaseParams()
+		releaseSlot()
 		return nil, nil, wrapInternal(err, "execute query")
 	}
 
-	if err := s.acquireQuerySlot(ctx); err != nil {
-		reader.Release()
-		stmt.Close()
-		conn.Close()
-		releaseParams()
-		return nil, nil, wrapInternal(err, "acquire query slot")
-	}
-
 	s.activeOps.Add(1)
-
 	schema := reader.Schema()
 
 	// Unbuffered or minimal buffer ensures true backpressure against the Flight stream
@@ -453,7 +482,7 @@ func (s *Server) buildStream(
 			stmt.Close()
 			conn.Close()
 			releaseParams()
-			s.releaseQuerySlot()
+			releaseSlot()
 			s.activeOps.Done()
 		})
 	}
@@ -680,12 +709,14 @@ func (s *Server) DoPutPreparedStatementQuery(
 ) ([]byte, error) {
 	handle := string(cmd.GetPreparedStatementHandle())
 
-	var newBatch arrow.RecordBatch
+	var rec arrow.RecordBatch
 	if reader.Next() {
-		rec := reader.RecordBatch()
-		if rec != nil {
-			rec.Retain()
-			newBatch = rec
+		rec = reader.RecordBatch()
+		// Explicitly handle nil batches; Arrow payloads may sometimes be absent.
+		if rec == nil {
+			if s.zapLogger != nil {
+				s.zapLogger.Debug("received nil RecordBatch in DoPutPreparedStatementQuery", zap.String("handle", handle))
+			}
 		}
 	}
 
@@ -694,9 +725,10 @@ func (s *Server) DoPutPreparedStatementQuery(
 	var oldGuard *BatchGuard
 	if ok {
 		oldGuard = e.paramGuard
-		if newBatch != nil {
-			e.paramGuard = NewBatchGuard(newBatch) // Transfers ownership to the guard
-			newBatch = nil
+		if rec != nil {
+			// Only retain the batch when we know the prepared statement exists.
+			rec.Retain()
+			e.paramGuard = NewBatchGuard(rec) // Transfers ownership to the guard
 		}
 		e.expires = time.Now().Add(s.handleTTL)
 		s.preparedStmts[handle] = e
@@ -704,8 +736,11 @@ func (s *Server) DoPutPreparedStatementQuery(
 	s.handlesMu.Unlock()
 
 	if !ok {
-		if newBatch != nil {
-			newBatch.Release()
+		if rec != nil {
+			rec.Release()
+		}
+		if s.zapLogger != nil {
+			s.zapLogger.Debug("DoPutPreparedStatementQuery missing prepared statement handle", zap.String("handle", handle))
 		}
 		return nil, ErrNotFound
 	}
@@ -726,9 +761,14 @@ func (s *Server) DoGetPreparedStatement(
 	e, ok := s.preparedStmts[handle]
 	var boundParams arrow.RecordBatch
 	if ok {
-		boundParams = e.paramGuard.Retain() // buildStream takes ownership of this Retain
+		if e.paramGuard != nil {
+			boundParams = e.paramGuard.Retain() // buildStream takes ownership of this Retain
+		}
 		e.expires = time.Now().Add(s.handleTTL)
 		s.preparedStmts[handle] = e
+		if s.zapLogger != nil {
+			s.zapLogger.Debug("prepared statement fetched", zap.String("handle", handle), zap.Bool("hasParams", boundParams != nil))
+		}
 	}
 	s.handlesMu.Unlock()
 
