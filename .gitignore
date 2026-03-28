@@ -24,7 +24,6 @@ arrow-go/
 .DS_Store
 test/integration/target/
 gocheck_artifacts/
-Dockerfile
 .dockerignore
 data/
 python/
