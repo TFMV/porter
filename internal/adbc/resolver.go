@@ -29,10 +29,9 @@ func DefaultResolver() *Resolver {
 func (r *Resolver) Resolve(d Driver, version string, p Platform) (*url.URL, error) {
 	tuple := p.Tuple()
 
-	// canonical layout:
-	// /drivers/<name>/<version>/<artifact>
+	// FIX: remove duplicate "drivers/" prefix
 	path := fmt.Sprintf(
-		"drivers/%s/%s/%s_%s-%s.tar.gz",
+		"%s/%s/%s_%s-%s.tar.gz",
 		d.Name,
 		version,
 		d.Name,
