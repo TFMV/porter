@@ -11,19 +11,14 @@ import (
 	"sync"
 	"time"
 
+	"github.com/TFMV/porter/execution/engine"
 	"github.com/apache/arrow-go/v18/arrow"
-	"github.com/apache/arrow-go/v18/arrow/flight"
 	"github.com/apache/arrow-go/v18/arrow/ipc"
 	"github.com/coder/websocket"
 	"github.com/coder/websocket/wsjson"
 )
 
-// Engine is the shared execution backend (same interface used by FlightSQL).
-type Engine interface {
-	BuildStream(ctx context.Context, sql string, params arrow.RecordBatch) (*arrow.Schema, <-chan flight.StreamChunk, error)
-	AcquireQuerySlot(ctx context.Context) error
-	ReleaseQuerySlot()
-}
+type Engine = engine.Engine
 
 type QueryRequest struct {
 	Query string `json:"query"`

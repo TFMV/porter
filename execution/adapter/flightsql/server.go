@@ -12,8 +12,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/TFMV/porter/execution/engine"
 	"github.com/apache/arrow-adbc/go/adbc"
-	"github.com/apache/arrow-adbc/go/adbc/drivermgr"
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
 	"github.com/apache/arrow-go/v18/arrow/flight"
@@ -43,6 +43,16 @@ var (
 	ErrCancelled  = status.Error(codes.Canceled, "execution cancelled by client")
 	ErrInvalidSQL = status.Error(codes.InvalidArgument, "invalid SQL statement")
 )
+
+type Engine interface {
+	BuildStream(ctx context.Context, sql string, params arrow.RecordBatch) (*arrow.Schema, <-chan flight.StreamChunk, error)
+	AcquireQuerySlot(ctx context.Context) error
+	ReleaseQuerySlot()
+	DeriveSchema(ctx context.Context, sql string) (*arrow.Schema, error)
+	ExecuteUpdate(ctx context.Context, sql string) (int64, error)
+	Allocator() memory.Allocator
+	Close() error
+}
 
 func wrapInternal(err error, msg string) error {
 	if err == nil {
@@ -117,6 +127,7 @@ func (e preparedEntry) isExpired() bool { return time.Now().After(e.expires) }
 type Server struct {
 	fsql.BaseServer
 
+	Engine             Engine
 	db                 adbc.Database
 	handleTTL          time.Duration
 	schemaProbeTimeout time.Duration
@@ -148,42 +159,31 @@ type Config struct {
 	ReadOnly             bool
 	Logger               *slog.Logger
 	DevMode              bool
+	Engine               Engine
 }
 
 func NewServer(cfg Config) (*Server, error) {
-	drv := drivermgr.Driver{}
-	dbPath := cfg.DBPath
-	if dbPath == "" {
-		dbPath = ":memory:"
+	var eng Engine
+	if cfg.Engine != nil {
+		eng = cfg.Engine
+	} else {
+		var err error
+		eng, err = engine.New(engine.Config{
+			DBPath:               cfg.DBPath,
+			MaxConcurrentQueries: cfg.MaxConcurrentQueries,
+			SchemaProbeTimeout:   cfg.SchemaProbeTimeout,
+			ReadOnly:             cfg.ReadOnly,
+			Logger:               cfg.Logger,
+			DevMode:              cfg.DevMode,
+		})
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	logger := cfg.Logger
 	if logger == nil {
 		logger = slog.Default()
-	}
-
-	logger.Debug("initializing DuckDB database", slog.String("dbPath", dbPath), slog.Bool("readOnly", cfg.ReadOnly))
-
-	params := map[string]string{
-		"driver": "duckdb",
-		"path":   dbPath,
-	}
-	if dbPath != ":memory:" {
-		if cfg.ReadOnly {
-			params["access_mode"] = "read_only"
-		} else {
-			params["access_mode"] = "read_write"
-		}
-	}
-
-	db, err := drv.NewDatabase(params)
-	if err != nil {
-		return nil, fmt.Errorf("open duckdb %q: %w", dbPath, err)
-	}
-
-	var alloc memory.Allocator = memory.NewGoAllocator()
-	if cfg.DevMode {
-		alloc = memory.NewCheckedAllocator(memory.NewGoAllocator())
 	}
 
 	handleTTL := cfg.HandleTTL
@@ -196,26 +196,16 @@ func NewServer(cfg Config) (*Server, error) {
 		gcInterval = defaultGCInterval
 	}
 
-	schemaProbeTimeout := cfg.SchemaProbeTimeout
-	if schemaProbeTimeout == 0 {
-		schemaProbeTimeout = defaultSchemaProbeTimeout
-	}
-
 	srv := &Server{
-		db:                 db,
-		handleTTL:          handleTTL,
-		gcInterval:         gcInterval,
-		schemaProbeTimeout: schemaProbeTimeout,
-		Alloc:              alloc,
-		Logger:             logger,
-		queryHandles:       make(map[string]queryHandle),
-		preparedStmts:      make(map[string]preparedEntry),
-		activeQueries:      make(map[int64]context.CancelFunc),
-		stopGC:             make(chan struct{}),
-	}
-
-	if cfg.MaxConcurrentQueries > 0 {
-		srv.querySemaphore = make(chan struct{}, cfg.MaxConcurrentQueries)
+		Engine:        eng,
+		handleTTL:     handleTTL,
+		gcInterval:    gcInterval,
+		Alloc:         eng.Allocator(),
+		Logger:        logger,
+		queryHandles:  make(map[string]queryHandle),
+		preparedStmts: make(map[string]preparedEntry),
+		activeQueries: make(map[int64]context.CancelFunc),
+		stopGC:        make(chan struct{}),
 	}
 
 	go srv.runGC()
@@ -283,7 +273,13 @@ func (s *Server) Shutdown(ctx context.Context) error {
 		}
 		s.preparedStmts = nil
 		s.handlesMu.Unlock()
-		return s.db.Close()
+		if s.Engine != nil {
+			return s.Engine.Close()
+		}
+		if s.db != nil {
+			return s.db.Close()
+		}
+		return nil
 	case <-ctx.Done():
 		return fmt.Errorf("shutdown timeout: %w", ctx.Err())
 	}
@@ -331,6 +327,9 @@ func (s *Server) evict() {
 }
 
 func (s *Server) acquireQuerySlot(ctx context.Context) error {
+	if s.Engine != nil {
+		return s.Engine.AcquireQuerySlot(ctx)
+	}
 	if s.querySemaphore == nil {
 		return nil
 	}
@@ -343,6 +342,10 @@ func (s *Server) acquireQuerySlot(ctx context.Context) error {
 }
 
 func (s *Server) releaseQuerySlot() {
+	if s.Engine != nil {
+		s.Engine.ReleaseQuerySlot()
+		return
+	}
 	if s.querySemaphore == nil {
 		return
 	}
@@ -369,7 +372,13 @@ func preparedStatementTicket(handle []byte) ([]byte, error) {
 }
 
 func (s *Server) deriveSchema(ctx context.Context, sql string) (*arrow.Schema, error) {
-	// Explicit lifecycle tracking for the probe executing
+	if s.Engine != nil {
+		return s.Engine.DeriveSchema(ctx, sql)
+	}
+	return s.deriveSchemaLegacy(ctx, sql)
+}
+
+func (s *Server) deriveSchemaLegacy(ctx context.Context, sql string) (*arrow.Schema, error) {
 	ctx, finishQuery := s.trackQuery(ctx)
 	defer finishQuery()
 
@@ -409,18 +418,24 @@ func (s *Server) deriveSchema(ctx context.Context, sql string) (*arrow.Schema, e
 
 // ─── BACKPRESSURE-AWARE STREAMING ─────────────────────────────────────────────
 
-// buildStream safely constructs an ADBC execution and wires it to a backpressure-aware
-// channel for the FlightSQL framework. It guarantees that parameters are released.
 func (s *Server) buildStream(
 	ctx context.Context,
 	sql string,
-	params arrow.RecordBatch, // Caller hands ownership to this function
+	params arrow.RecordBatch,
 ) (*arrow.Schema, <-chan flight.StreamChunk, error) {
+	if s.Engine != nil {
+		return s.Engine.BuildStream(ctx, sql, params)
+	}
+	return s.buildStreamLegacy(ctx, sql, params)
+}
 
-	// Track explicit lifecycle for execution
+func (s *Server) buildStreamLegacy(
+	ctx context.Context,
+	sql string,
+	params arrow.RecordBatch,
+) (*arrow.Schema, <-chan flight.StreamChunk, error) {
 	ctx, finishQuery := s.trackQuery(ctx)
 
-	// Guarantee parameter release on all exit paths
 	cleanupParams := sync.Once{}
 	releaseParams := func() {
 		cleanupParams.Do(func() {
@@ -439,7 +454,6 @@ func (s *Server) buildStream(
 		s.releaseQuerySlot()
 	}
 
-	// abort is used for early exits before background goroutine takes over
 	abort := func() {
 		releaseParams()
 		releaseSlot()
@@ -490,7 +504,6 @@ func (s *Server) buildStream(
 		}
 	}
 
-	// Tracked ctx guarantees executing block aborts deterministically on shutdown.
 	reader, _, err := stmt.ExecuteQuery(ctx)
 	if err != nil {
 		stmt.Close()
@@ -501,7 +514,6 @@ func (s *Server) buildStream(
 
 	schema := reader.Schema()
 
-	// Unbuffered or minimal buffer ensures true backpressure against the Flight stream
 	ch := make(chan flight.StreamChunk, 1)
 
 	var cleanupOnce sync.Once
@@ -512,7 +524,7 @@ func (s *Server) buildStream(
 			conn.Close()
 			releaseParams()
 			releaseSlot()
-			finishQuery() // untracks operation & signals activeOps.Done()
+			finishQuery()
 		})
 	}
 
@@ -839,7 +851,13 @@ func (s *Server) DoPutCommandStatementUpdate(
 		return 0, ErrEmptyQuery
 	}
 
-	// Track operation lifecycle
+	if s.Engine != nil {
+		return s.Engine.ExecuteUpdate(ctx, sql)
+	}
+	return s.executeUpdateLegacy(ctx, sql)
+}
+
+func (s *Server) executeUpdateLegacy(ctx context.Context, sql string) (int64, error) {
 	ctx, finishQuery := s.trackQuery(ctx)
 	defer finishQuery()
 

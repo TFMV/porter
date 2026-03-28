@@ -33,6 +33,8 @@ func init() {
 
 	rootCmd.PersistentFlags().String("db", ":memory:", "DuckDB database path or :memory:")
 	rootCmd.PersistentFlags().Int("port", 32010, "FlightSQL server port")
+	rootCmd.PersistentFlags().Bool("ws", false, "Enable WebSocket endpoint")
+	rootCmd.PersistentFlags().Int("ws-port", 8080, "WebSocket server port")
 
 	if err := viper.BindPFlag("db", rootCmd.PersistentFlags().Lookup("db")); err != nil {
 		fmt.Fprintln(os.Stderr, err)
@@ -42,8 +44,18 @@ func init() {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
+	if err := viper.BindPFlag("ws", rootCmd.PersistentFlags().Lookup("ws")); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	if err := viper.BindPFlag("ws-port", rootCmd.PersistentFlags().Lookup("ws-port")); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
 	viper.SetDefault("db", ":memory:")
 	viper.SetDefault("port", 32010)
+	viper.SetDefault("ws", false)
+	viper.SetDefault("ws-port", 8080)
 
 	viper.SetEnvPrefix("PORTER")
 	viper.AutomaticEnv()
@@ -53,6 +65,14 @@ func init() {
 		os.Exit(1)
 	}
 	if err := viper.BindEnv("port"); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	if err := viper.BindEnv("ws"); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	if err := viper.BindEnv("ws-port"); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
