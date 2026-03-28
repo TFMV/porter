@@ -20,7 +20,6 @@ import (
 	pb "github.com/apache/arrow-go/v18/arrow/flight/gen/flight"
 	"github.com/apache/arrow-go/v18/arrow/ipc"
 	"github.com/apache/arrow-go/v18/arrow/memory"
-	"go.uber.org/zap"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
@@ -122,7 +121,6 @@ type Server struct {
 	schemaProbeTimeout time.Duration
 	Alloc              memory.Allocator
 	Logger             *slog.Logger
-	zapLogger          *zap.Logger
 	gcInterval         time.Duration
 	queryHandles       map[string]queryHandle
 	preparedStmts      map[string]preparedEntry
@@ -130,6 +128,8 @@ type Server struct {
 
 	activeOps      sync.WaitGroup
 	querySemaphore chan struct{}
+	shutdownCtx    context.Context
+	shutdownCancel context.CancelFunc
 
 	stopGC     chan struct{}
 	stopGCOnce sync.Once
@@ -182,16 +182,6 @@ func NewServer(cfg Config) (*Server, error) {
 		alloc = memory.NewCheckedAllocator(memory.NewGoAllocator())
 	}
 
-	var zapLogger *zap.Logger
-	if cfg.DevMode {
-		zapLogger, err = zap.NewDevelopment()
-	} else {
-		zapLogger, err = zap.NewProduction()
-	}
-	if err != nil {
-		return nil, fmt.Errorf("initialize logger: %w", err)
-	}
-
 	handleTTL := cfg.HandleTTL
 	if handleTTL == 0 {
 		handleTTL = defaultHandleTTL
@@ -214,11 +204,15 @@ func NewServer(cfg Config) (*Server, error) {
 		schemaProbeTimeout: schemaProbeTimeout,
 		Alloc:              alloc,
 		Logger:             logger,
-		zapLogger:          zapLogger,
 		queryHandles:       make(map[string]queryHandle),
 		preparedStmts:      make(map[string]preparedEntry),
 		stopGC:             make(chan struct{}),
+		shutdownCtx:        nil,
+		shutdownCancel:     nil,
 	}
+	shutdownCtx, shutdownCancel := context.WithCancel(context.Background())
+	srv.shutdownCtx = shutdownCtx
+	srv.shutdownCancel = shutdownCancel
 
 	if cfg.MaxConcurrentQueries > 0 {
 		srv.querySemaphore = make(chan struct{}, cfg.MaxConcurrentQueries)
@@ -228,13 +222,28 @@ func NewServer(cfg Config) (*Server, error) {
 	return srv, nil
 }
 
+func (s *Server) withShutdown(ctx context.Context) context.Context {
+	if s == nil || s.shutdownCtx == nil {
+		return ctx
+	}
+	ctx, cancel := context.WithCancel(ctx)
+	go func() {
+		select {
+		case <-ctx.Done():
+		case <-s.shutdownCtx.Done():
+			cancel()
+		}
+	}()
+	return ctx
+}
+
 type flightServerWithExchange struct {
 	flight.FlightServer
 	srv *Server
 }
 
 func (f *flightServerWithExchange) DoExchange(stream flight.FlightService_DoExchangeServer) error {
-	return f.srv.DoExchange(stream.Context(), stream)
+	return f.srv.DoExchange(f.srv.withShutdown(stream.Context()), stream)
 }
 
 func (s *Server) AsFlightServer() flight.FlightServer {
@@ -246,6 +255,10 @@ func (s *Server) Close() error {
 }
 
 func (s *Server) Shutdown(ctx context.Context) error {
+	if s.shutdownCancel != nil {
+		s.shutdownCancel()
+	}
+
 	s.stopGCOnce.Do(func() {
 		close(s.stopGC)
 	})
@@ -335,7 +348,7 @@ func (s *Server) releaseQuerySlot() {
 // ─── UTILS ────────────────────────────────────────────────────────────────────
 
 func newHandle() (string, error) {
-	b := make([]byte, 16)
+	b := make([]byte, handleSize)
 	if _, err := rand.Read(b); err != nil {
 		return "", wrapInternal(err, "failed to generate handle")
 	}
@@ -352,6 +365,7 @@ func preparedStatementTicket(handle []byte) ([]byte, error) {
 }
 
 func (s *Server) deriveSchema(ctx context.Context, sql string) (*arrow.Schema, error) {
+	start := time.Now()
 	probeCtx, cancel := context.WithTimeout(ctx, s.schemaProbeTimeout)
 	defer cancel()
 
@@ -378,7 +392,11 @@ func (s *Server) deriveSchema(ctx context.Context, sql string) (*arrow.Schema, e
 	}
 	defer reader.Release()
 
-	return reader.Schema(), nil
+	schema := reader.Schema()
+	if s.Logger != nil {
+		s.Logger.Debug("schema probe completed", slog.String("sql", sql), slog.Duration("duration", time.Since(start)))
+	}
+	return schema, nil
 }
 
 // ─── BACKPRESSURE-AWARE STREAMING ─────────────────────────────────────────────
@@ -390,6 +408,7 @@ func (s *Server) buildStream(
 	sql string,
 	params arrow.RecordBatch, // Caller hands ownership to this function
 ) (*arrow.Schema, <-chan flight.StreamChunk, error) {
+	ctx = s.withShutdown(ctx)
 
 	// Guarantee parameter release on all exit paths (early return or after streaming)
 	cleanupParams := sync.Once{}
@@ -416,8 +435,8 @@ func (s *Server) buildStream(
 		return nil, nil, err
 	}
 
-	if s.zapLogger != nil {
-		s.zapLogger.Debug("query slot acquired before execution", zap.String("sql", sql), zap.Bool("hasParams", params != nil))
+	if s.Logger != nil {
+		s.Logger.Debug("query slot acquired before execution", slog.String("sql", sql), slog.Bool("hasParams", params != nil))
 	}
 
 	conn, err := s.db.Open(ctx)
@@ -654,8 +673,15 @@ func (s *Server) GetFlightInfoPreparedStatement(
 ) (*flight.FlightInfo, error) {
 	handle := string(cmd.GetPreparedStatementHandle())
 
-	s.handlesMu.Lock()
+	s.handlesMu.RLock()
 	e, ok := s.preparedStmts[handle]
+	s.handlesMu.RUnlock()
+	if !ok {
+		return nil, ErrNotFound
+	}
+
+	s.handlesMu.Lock()
+	e, ok = s.preparedStmts[handle]
 	if ok {
 		e.expires = time.Now().Add(s.handleTTL)
 		s.preparedStmts[handle] = e
@@ -684,10 +710,10 @@ func (s *Server) GetSchemaPreparedStatement(
 	cmd fsql.PreparedStatementQuery,
 	_ *flight.FlightDescriptor,
 ) (*flight.SchemaResult, error) {
-	handle := string(cmd.GetPreparedStatementHandle())
+	key := cmd.GetPreparedStatementHandle()
 
 	s.handlesMu.RLock()
-	e, ok := s.preparedStmts[handle]
+	e, ok := s.preparedStmts[string(key)]
 	s.handlesMu.RUnlock()
 
 	if !ok {
@@ -707,15 +733,16 @@ func (s *Server) DoPutPreparedStatementQuery(
 	reader flight.MessageReader,
 	_ flight.MetadataWriter,
 ) ([]byte, error) {
-	handle := string(cmd.GetPreparedStatementHandle())
+	handleBytes := cmd.GetPreparedStatementHandle()
+	handle := string(handleBytes)
 
 	var rec arrow.RecordBatch
 	if reader.Next() {
 		rec = reader.RecordBatch()
 		// Explicitly handle nil batches; Arrow payloads may sometimes be absent.
 		if rec == nil {
-			if s.zapLogger != nil {
-				s.zapLogger.Debug("received nil RecordBatch in DoPutPreparedStatementQuery", zap.String("handle", handle))
+			if s.Logger != nil {
+				s.Logger.Debug("received nil RecordBatch in DoPutPreparedStatementQuery", slog.String("handle", handle))
 			}
 		}
 	}
@@ -739,8 +766,8 @@ func (s *Server) DoPutPreparedStatementQuery(
 		if rec != nil {
 			rec.Release()
 		}
-		if s.zapLogger != nil {
-			s.zapLogger.Debug("DoPutPreparedStatementQuery missing prepared statement handle", zap.String("handle", handle))
+		if s.Logger != nil {
+			s.Logger.Debug("DoPutPreparedStatementQuery missing prepared statement handle", slog.String("handle", handle))
 		}
 		return nil, ErrNotFound
 	}
@@ -766,8 +793,8 @@ func (s *Server) DoGetPreparedStatement(
 		}
 		e.expires = time.Now().Add(s.handleTTL)
 		s.preparedStmts[handle] = e
-		if s.zapLogger != nil {
-			s.zapLogger.Debug("prepared statement fetched", zap.String("handle", handle), zap.Bool("hasParams", boundParams != nil))
+		if s.Logger != nil {
+			s.Logger.Debug("prepared statement fetched", slog.String("handle", handle), slog.Bool("hasParams", boundParams != nil))
 		}
 	}
 	s.handlesMu.Unlock()
@@ -878,18 +905,19 @@ func (s *Server) DoExchange(
 	}
 
 	var params arrow.RecordBatch
+	var readErr error
 	if len(msg.GetDataHeader()) > 0 || len(msg.GetDataBody()) > 0 {
-		params, err = s.readFlightDataParameterBatch(msg, stream)
+		params, readErr = s.readFlightDataParameterBatch(msg, stream)
 	} else {
-		next, err := stream.Recv()
-		if err == nil && (len(next.GetDataHeader()) > 0 || len(next.GetDataBody()) > 0) {
-			params, err = s.readFlightDataParameterBatch(next, stream)
-		} else if err != nil && err != io.EOF {
-			return wrapInternal(err, "recv param batch")
+		next, recvErr := stream.Recv()
+		if recvErr == nil && (len(next.GetDataHeader()) > 0 || len(next.GetDataBody()) > 0) {
+			params, readErr = s.readFlightDataParameterBatch(next, stream)
+		} else if recvErr != nil && recvErr != io.EOF {
+			return wrapInternal(recvErr, "recv param batch")
 		}
 	}
-	if err != nil {
-		return err
+	if readErr != nil {
+		return readErr
 	}
 
 	// We utilize buildStream to manage the ADBC lifecycle, but consume the channel immediately.
