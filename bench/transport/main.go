@@ -303,7 +303,7 @@ func decodeIPC(payload []byte) (rows int, batches int, logicalBytes int64, err e
 	defer r.Release()
 
 	for r.Next() {
-		rec := r.Record()
+		rec := r.RecordBatch()
 		if rec == nil {
 			continue
 		}
@@ -315,7 +315,7 @@ func decodeIPC(payload []byte) (rows int, batches int, logicalBytes int64, err e
 	return rows, batches, logicalBytes, r.Err()
 }
 
-func logicalRecordBytes(rec arrow.Record) int64 {
+func logicalRecordBytes(rec arrow.RecordBatch) int64 {
 	var total int64
 	for i := 0; i < int(rec.NumCols()); i++ {
 		total += logicalArrayBytes(rec.Column(i))

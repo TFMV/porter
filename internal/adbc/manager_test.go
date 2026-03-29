@@ -9,6 +9,7 @@ import (
 
 func testManager(t *testing.T) *Manager {
 	t.Helper()
+	os.Unsetenv("ADBC_DRIVER_PATH")
 	return &Manager{
 		CacheDir: t.TempDir(),
 		Resolver: DefaultResolver(),

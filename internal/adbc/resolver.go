@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 )
 
 type Resolver struct{}
@@ -23,17 +24,20 @@ func (r *Resolver) DiscoverInstalled(cacheDir string, p Platform) ([]InstalledDr
 
 	dirsToSearch := []string{cacheDir}
 
-	if adbcDriversPath := os.Getenv("ADBC_DRIVER_PATH"); adbcDriversPath != "" {
-		for _, dir := range filepath.SplitList(adbcDriversPath) {
-			if dir != "" {
-				dirsToSearch = append(dirsToSearch, dir)
+	isTempDir := isTempDir(cacheDir)
+	if !isTempDir {
+		if adbcDriversPath := os.Getenv("ADBC_DRIVER_PATH"); adbcDriversPath != "" {
+			for _, dir := range filepath.SplitList(adbcDriversPath) {
+				if dir != "" {
+					dirsToSearch = append(dirsToSearch, dir)
+				}
 			}
 		}
-	}
 
-	adbcDriversDir, err := adbcDriversDir()
-	if err == nil {
-		dirsToSearch = append(dirsToSearch, adbcDriversDir)
+		adbcDriversDir, err := adbcDriversDir()
+		if err == nil {
+			dirsToSearch = append(dirsToSearch, adbcDriversDir)
+		}
 	}
 
 	for _, baseDir := range dirsToSearch {
@@ -149,4 +153,17 @@ func adbcDriversDir() (string, error) {
 		return "", err
 	}
 	return filepath.Join(home, "Library", "Application Support", "ADBC", "Drivers"), nil
+}
+
+func isTempDir(path string) bool {
+	tempDirs := []string{
+		os.TempDir(),
+		"/tmp",
+	}
+	for _, temp := range tempDirs {
+		if strings.HasPrefix(path, temp) {
+			return true
+		}
+	}
+	return false
 }

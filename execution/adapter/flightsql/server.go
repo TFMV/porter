@@ -12,7 +12,6 @@ import (
 
 	"github.com/TFMV/porter/execution/engine"
 	"github.com/apache/arrow-go/v18/arrow"
-	"github.com/apache/arrow-go/v18/arrow/array"
 	"github.com/apache/arrow-go/v18/arrow/flight"
 	fsql "github.com/apache/arrow-go/v18/arrow/flight/flightsql"
 	pb "github.com/apache/arrow-go/v18/arrow/flight/gen/flight"
@@ -260,55 +259,6 @@ func (s *Server) buildStream(
 	params arrow.RecordBatch,
 ) (*arrow.Schema, <-chan flight.StreamChunk, error) {
 	return s.Engine.BuildStream(ctx, sql, params)
-}
-
-// pumpRecordsSafely streams records with strict context cancellation checks.
-func pumpRecordsSafely(
-	ctx context.Context,
-	reader array.RecordReader,
-	cleanup func(),
-	ch chan<- flight.StreamChunk,
-) {
-	defer close(ch)
-	defer cleanup()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		default:
-		}
-
-		ok := reader.Next()
-		if !ok {
-			break
-		}
-
-		if ctx.Err() != nil {
-			return
-		}
-
-		rec := reader.RecordBatch()
-		if rec == nil {
-			continue
-		}
-
-		rec.Retain()
-
-		select {
-		case ch <- flight.StreamChunk{Data: rec}:
-		case <-ctx.Done():
-			rec.Release()
-			return
-		}
-	}
-
-	if err := reader.Err(); err != nil {
-		select {
-		case ch <- flight.StreamChunk{Err: wrapInternal(err, "record reader error")}:
-		case <-ctx.Done():
-		}
-	}
 }
 
 // ─── FLIGHTSQL STATEMENT ROUTING ──────────────────────────────────────────────
