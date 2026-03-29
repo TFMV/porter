@@ -201,7 +201,7 @@ func executeQuery(ctx context.Context, conn *websocket.Conn, query string, quiet
 
 		if msgType == websocket.MessageText {
 			var schemaMsg map[string]interface{}
-			json.Unmarshal(msg, &schemaMsg)
+			_ = json.Unmarshal(msg, &schemaMsg)
 		} else if msgType == websocket.MessageBinary {
 			rowCount, err := decodeIPC(msg)
 			if err != nil {
@@ -225,7 +225,7 @@ func decodeIPC(data []byte) (int, error) {
 
 	var totalRows int
 	for reader.Next() {
-		rec := reader.Record()
+		rec := reader.RecordBatch()
 		if rec != nil {
 			totalRows += int(rec.NumRows())
 			rec.Release()

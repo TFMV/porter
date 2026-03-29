@@ -129,7 +129,7 @@ func decodeIPC(data []byte, schema *arrow.Schema) (int, *arrow.Schema, error) {
 		return 0, outSchema, nil
 	}
 
-	rec := reader.Record()
+	rec := reader.RecordBatch()
 	if rec == nil {
 		return 0, outSchema, nil
 	}
@@ -146,7 +146,7 @@ func printBatch(data []byte, schema *arrow.Schema) {
 	defer reader.Release()
 
 	for reader.Next() {
-		rec := reader.Record()
+		rec := reader.RecordBatch()
 		if rec == nil {
 			continue
 		}
@@ -156,7 +156,7 @@ func printBatch(data []byte, schema *arrow.Schema) {
 	}
 }
 
-func printRecord(rec arrow.Record) {
+func printRecord(rec arrow.RecordBatch) {
 	ncols := int(rec.NumCols())
 	nrows := int(rec.NumRows())
 

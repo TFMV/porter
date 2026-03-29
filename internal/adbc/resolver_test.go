@@ -7,6 +7,7 @@ import (
 )
 
 func TestResolver_DiscoverInstalled_Deterministic(t *testing.T) {
+	os.Unsetenv("ADBC_DRIVER_PATH")
 	r := DefaultResolver()
 	cache := t.TempDir()
 	tuple := Platform{OS: "linux", Arch: "amd64"}.Tuple()
