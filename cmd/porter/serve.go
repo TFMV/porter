@@ -12,7 +12,7 @@ import (
 
 	flightsql "github.com/TFMV/porter/execution/adapter/flightsql"
 	ws "github.com/TFMV/porter/execution/adapter/ws"
-	enginePkg "github.com/TFMV/porter/execution/engine"
+	"github.com/TFMV/porter/execution/engine"
 	"github.com/apache/arrow-go/v18/arrow/flight"
 	"github.com/spf13/cobra"
 	"google.golang.org/grpc"
@@ -51,7 +51,7 @@ func init() {
 func runServe(cfg porterConfig) error {
 	cfg.DBPath = normalizeDBPath(cfg.DBPath)
 
-	eng, err := enginePkg.New(enginePkg.Config{
+	eng, err := engine.New(engine.Config{
 		DBPath: cfg.DBPath,
 	})
 	if err != nil {

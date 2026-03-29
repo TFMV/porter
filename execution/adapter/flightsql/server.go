@@ -5,15 +5,12 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
-	"fmt"
 	"io"
 	"log/slog"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/TFMV/porter/execution/engine"
-	"github.com/apache/arrow-adbc/go/adbc"
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
 	"github.com/apache/arrow-go/v18/arrow/flight"
@@ -44,15 +41,7 @@ var (
 	ErrInvalidSQL = status.Error(codes.InvalidArgument, "invalid SQL statement")
 )
 
-type Engine interface {
-	BuildStream(ctx context.Context, sql string, params arrow.RecordBatch) (*arrow.Schema, <-chan flight.StreamChunk, error)
-	AcquireQuerySlot(ctx context.Context) error
-	ReleaseQuerySlot()
-	DeriveSchema(ctx context.Context, sql string) (*arrow.Schema, error)
-	ExecuteUpdate(ctx context.Context, sql string) (int64, error)
-	Allocator() memory.Allocator
-	Close() error
-}
+type Engine = engine.Engine
 
 func wrapInternal(err error, msg string) error {
 	if err == nil {
@@ -91,24 +80,14 @@ func (e preparedEntry) isExpired() bool { return time.Now().After(e.expires) }
 type Server struct {
 	fsql.BaseServer
 
-	Engine             Engine
-	db                 adbc.Database
-	handleTTL          time.Duration
-	schemaProbeTimeout time.Duration
-	Alloc              memory.Allocator
-	Logger             *slog.Logger
-	gcInterval         time.Duration
-	queryHandles       map[string]queryHandle
-	preparedStmts      map[string]preparedEntry
-	handlesMu          sync.RWMutex
-
-	// Query Lifecycle Tracking
-	activeOps       sync.WaitGroup
-	activeQueries   map[int64]context.CancelFunc
-	activeQueriesMu sync.Mutex
-	nextQueryID     int64
-
-	querySemaphore chan struct{}
+	Engine        Engine
+	handleTTL     time.Duration
+	Alloc         memory.Allocator
+	Logger        *slog.Logger
+	gcInterval    time.Duration
+	queryHandles  map[string]queryHandle
+	preparedStmts map[string]preparedEntry
+	handlesMu     sync.RWMutex
 
 	stopGC     chan struct{}
 	stopGCOnce sync.Once
@@ -168,7 +147,6 @@ func NewServer(cfg Config) (*Server, error) {
 		Logger:        logger,
 		queryHandles:  make(map[string]queryHandle),
 		preparedStmts: make(map[string]preparedEntry),
-		activeQueries: make(map[int64]context.CancelFunc),
 		stopGC:        make(chan struct{}),
 	}
 
@@ -178,75 +156,28 @@ func NewServer(cfg Config) (*Server, error) {
 
 // ─── LIFECYCLE MANAGEMENT ─────────────────────────────────────────────────────
 
-// trackQuery provides explicit lifecycle tracking. It ensures:
-// 1. Every operation has a cancellable context.
-// 2. The cancellation is centrally registered for Shutdown.
-// 3. The WaitGroup prevents leaks of goroutines or native execution.
-func (s *Server) trackQuery(ctx context.Context) (context.Context, func()) {
-	ctx, cancel := context.WithCancel(ctx)
-	id := atomic.AddInt64(&s.nextQueryID, 1)
-
-	s.activeQueriesMu.Lock()
-	s.activeQueries[id] = cancel
-	s.activeQueriesMu.Unlock()
-
-	s.activeOps.Add(1)
-
-	cleanup := func() {
-		s.activeQueriesMu.Lock()
-		delete(s.activeQueries, id)
-		s.activeQueriesMu.Unlock()
-		cancel()
-		s.activeOps.Done()
-	}
-	return ctx, cleanup
-}
-
 func (s *Server) Close() error {
 	return s.Shutdown(context.Background())
 }
 
 func (s *Server) Shutdown(ctx context.Context) error {
-	// 1. Set shutdown state for background tasks
 	s.stopGCOnce.Do(func() {
 		close(s.stopGC)
 	})
 
-	// 2. Cancel all active query contexts explicitly
-	s.activeQueriesMu.Lock()
-	for _, cancel := range s.activeQueries {
-		cancel()
+	s.handlesMu.Lock()
+	for _, e := range s.preparedStmts {
+		if e.paramGuard != nil {
+			e.paramGuard.Release()
+		}
 	}
-	s.activeQueriesMu.Unlock()
+	s.preparedStmts = nil
+	s.handlesMu.Unlock()
 
-	// 3. Wait for activeOps to drain
-	done := make(chan struct{})
-	go func() {
-		s.activeOps.Wait()
-		close(done)
-	}()
-
-	// 4. Apply timeout guard to prevent deadlock
-	select {
-	case <-done:
-		s.handlesMu.Lock()
-		for _, e := range s.preparedStmts {
-			if e.paramGuard != nil {
-				e.paramGuard.Release()
-			}
-		}
-		s.preparedStmts = nil
-		s.handlesMu.Unlock()
-		if s.Engine != nil {
-			return s.Engine.Close()
-		}
-		if s.db != nil {
-			return s.db.Close()
-		}
-		return nil
-	case <-ctx.Done():
-		return fmt.Errorf("shutdown timeout: %w", ctx.Err())
+	if s.Engine != nil {
+		return s.Engine.Close()
 	}
+	return nil
 }
 
 // ─── GC & EVICTION ────────────────────────────────────────────────────────────
@@ -291,29 +222,11 @@ func (s *Server) evict() {
 }
 
 func (s *Server) acquireQuerySlot(ctx context.Context) error {
-	if s.Engine != nil {
-		return s.Engine.AcquireQuerySlot(ctx)
-	}
-	if s.querySemaphore == nil {
-		return nil
-	}
-	select {
-	case s.querySemaphore <- struct{}{}:
-		return nil
-	case <-ctx.Done():
-		return ctx.Err()
-	}
+	return s.Engine.AcquireQuerySlot(ctx)
 }
 
 func (s *Server) releaseQuerySlot() {
-	if s.Engine != nil {
-		s.Engine.ReleaseQuerySlot()
-		return
-	}
-	if s.querySemaphore == nil {
-		return
-	}
-	<-s.querySemaphore
+	s.Engine.ReleaseQuerySlot()
 }
 
 // ─── UTILS ────────────────────────────────────────────────────────────────────
@@ -336,48 +249,7 @@ func preparedStatementTicket(handle []byte) ([]byte, error) {
 }
 
 func (s *Server) deriveSchema(ctx context.Context, sql string) (*arrow.Schema, error) {
-	if s.Engine != nil {
-		return s.Engine.DeriveSchema(ctx, sql)
-	}
-	return s.deriveSchemaLegacy(ctx, sql)
-}
-
-func (s *Server) deriveSchemaLegacy(ctx context.Context, sql string) (*arrow.Schema, error) {
-	ctx, finishQuery := s.trackQuery(ctx)
-	defer finishQuery()
-
-	start := time.Now()
-	probeCtx, cancel := context.WithTimeout(ctx, s.schemaProbeTimeout)
-	defer cancel()
-
-	conn, err := s.db.Open(probeCtx)
-	if err != nil {
-		return nil, wrapInternal(err, "failed to open adbc connection")
-	}
-	defer conn.Close()
-
-	stmt, err := conn.NewStatement()
-	if err != nil {
-		return nil, wrapInternal(err, "failed to create adbc statement")
-	}
-	defer stmt.Close()
-
-	probe := fmt.Sprintf("SELECT * FROM (%s) AS _schema_probe LIMIT 0", sql)
-	if err := stmt.SetSqlQuery(probe); err != nil {
-		return nil, status.Errorf(codes.InvalidArgument, "invalid sql for schema derivation: %v", err)
-	}
-
-	reader, _, err := stmt.ExecuteQuery(probeCtx)
-	if err != nil {
-		return nil, wrapInternal(err, "failed to execute schema probe")
-	}
-	defer reader.Release()
-
-	schema := reader.Schema()
-	if s.Logger != nil {
-		s.Logger.Debug("schema probe completed", slog.String("sql", sql), slog.Duration("duration", time.Since(start)))
-	}
-	return schema, nil
+	return s.Engine.DeriveSchema(ctx, sql)
 }
 
 // ─── BACKPRESSURE-AWARE STREAMING ─────────────────────────────────────────────
@@ -387,113 +259,7 @@ func (s *Server) buildStream(
 	sql string,
 	params arrow.RecordBatch,
 ) (*arrow.Schema, <-chan flight.StreamChunk, error) {
-	if s.Engine != nil {
-		return s.Engine.BuildStream(ctx, sql, params)
-	}
-	return s.buildStreamLegacy(ctx, sql, params)
-}
-
-func (s *Server) buildStreamLegacy(
-	ctx context.Context,
-	sql string,
-	params arrow.RecordBatch,
-) (*arrow.Schema, <-chan flight.StreamChunk, error) {
-	ctx, finishQuery := s.trackQuery(ctx)
-
-	cleanupParams := sync.Once{}
-	releaseParams := func() {
-		cleanupParams.Do(func() {
-			if params != nil {
-				params.Release()
-			}
-		})
-	}
-
-	slotReleased := false
-	releaseSlot := func() {
-		if slotReleased {
-			return
-		}
-		slotReleased = true
-		s.releaseQuerySlot()
-	}
-
-	abort := func() {
-		releaseParams()
-		releaseSlot()
-		finishQuery()
-	}
-
-	if err := s.acquireQuerySlot(ctx); err != nil {
-		abort()
-		return nil, nil, err
-	}
-
-	if s.Logger != nil {
-		s.Logger.Debug("query slot acquired before execution", slog.String("sql", sql), slog.Bool("hasParams", params != nil))
-	}
-
-	conn, err := s.db.Open(ctx)
-	if err != nil {
-		abort()
-		return nil, nil, wrapInternal(err, "open db connection")
-	}
-
-	stmt, err := conn.NewStatement()
-	if err != nil {
-		conn.Close()
-		abort()
-		return nil, nil, wrapInternal(err, "create statement")
-	}
-
-	if err := stmt.SetSqlQuery(sql); err != nil {
-		stmt.Close()
-		conn.Close()
-		abort()
-		return nil, nil, ErrInvalidSQL
-	}
-
-	if params != nil {
-		if err := stmt.Prepare(ctx); err != nil {
-			stmt.Close()
-			conn.Close()
-			abort()
-			return nil, nil, wrapInternal(err, "prepare statement")
-		}
-		if err := stmt.Bind(ctx, params); err != nil {
-			stmt.Close()
-			conn.Close()
-			abort()
-			return nil, nil, wrapInternal(err, "bind parameters")
-		}
-	}
-
-	reader, _, err := stmt.ExecuteQuery(ctx)
-	if err != nil {
-		stmt.Close()
-		conn.Close()
-		abort()
-		return nil, nil, wrapInternal(err, "execute query")
-	}
-
-	schema := reader.Schema()
-
-	ch := make(chan flight.StreamChunk, 1)
-
-	var cleanupOnce sync.Once
-	cleanup := func() {
-		cleanupOnce.Do(func() {
-			reader.Release()
-			stmt.Close()
-			conn.Close()
-			releaseParams()
-			releaseSlot()
-			finishQuery()
-		})
-	}
-
-	go pumpRecordsSafely(ctx, reader, cleanup, ch)
-	return schema, ch, nil
+	return s.Engine.BuildStream(ctx, sql, params)
 }
 
 // pumpRecordsSafely streams records with strict context cancellation checks.
@@ -815,32 +581,7 @@ func (s *Server) DoPutCommandStatementUpdate(
 		return 0, ErrEmptyQuery
 	}
 
-	if s.Engine != nil {
-		return s.Engine.ExecuteUpdate(ctx, sql)
-	}
-	return s.executeUpdateLegacy(ctx, sql)
-}
-
-func (s *Server) executeUpdateLegacy(ctx context.Context, sql string) (int64, error) {
-	ctx, finishQuery := s.trackQuery(ctx)
-	defer finishQuery()
-
-	conn, err := s.db.Open(ctx)
-	if err != nil {
-		return 0, wrapInternal(err, "open db connection")
-	}
-	defer conn.Close()
-
-	stmt, err := conn.NewStatement()
-	if err != nil {
-		return 0, wrapInternal(err, "create statement")
-	}
-	defer stmt.Close()
-
-	if err := stmt.SetSqlQuery(sql); err != nil {
-		return 0, ErrInvalidSQL
-	}
-	return stmt.ExecuteUpdate(ctx)
+	return s.Engine.ExecuteUpdate(ctx, sql)
 }
 
 // ─── DOEXCHANGE (ZERO-COPY DIRECT STREAMING) ──────────────────────────────────
@@ -962,10 +703,7 @@ type flightServerWithExchange struct {
 }
 
 func (f *flightServerWithExchange) DoExchange(stream flight.FlightService_DoExchangeServer) error {
-	// Track the entire gRPC exchange lifecycle
-	ctx, cleanup := f.srv.trackQuery(stream.Context())
-	defer cleanup()
-	return f.srv.DoExchange(ctx, stream)
+	return f.srv.DoExchange(stream.Context(), stream)
 }
 
 func (s *Server) AsFlightServer() flight.FlightServer {
