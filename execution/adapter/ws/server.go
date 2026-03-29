@@ -116,6 +116,8 @@ func (h *streamHandler) serve(ctx context.Context) {
 
 		h.engine.ReleaseQuerySlot()
 		cancelExec()
+		h.close(websocket.StatusNormalClosure, "query complete")
+		return
 	}
 }
 
