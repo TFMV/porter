@@ -138,9 +138,18 @@ func TestServer_StreamSuccess_Full(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
-	_, data, err := c.Read(ctx)
+	msgType, data, err := c.Read(ctx)
 	if err != nil {
+		// With continuous streaming, server closes connection after stream ends
+		// If we get a close frame after schema, that's expected
+		if websocket.CloseStatus(err) == websocket.StatusNormalClosure {
+			return
+		}
 		t.Fatalf("read frame failed: %v", err)
+	}
+
+	if msgType != websocket.MessageBinary {
+		t.Fatalf("expected binary message, got %v", msgType)
 	}
 
 	if len(data) == 0 {
