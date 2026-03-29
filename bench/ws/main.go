@@ -15,7 +15,6 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/ipc"
 	"github.com/coder/websocket"
 	"github.com/coder/websocket/wsjson"
@@ -187,42 +186,51 @@ func executeQuery(ctx context.Context, conn *websocket.Conn, query string, quiet
 	readCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 
+	var totalRows int64
+	var totalBytes int64
+	hasData := false
+
 	for {
 		msgType, msg, err := conn.Read(readCtx)
 		if err != nil {
-			return false, 0, 0
+			if websocket.CloseStatus(err) == websocket.StatusNormalClosure {
+				return hasData, totalRows, totalBytes
+			}
+			break
 		}
 
 		if msgType == websocket.MessageText {
 			var schemaMsg map[string]interface{}
 			json.Unmarshal(msg, &schemaMsg)
 		} else if msgType == websocket.MessageBinary {
-			r, rowCount, err := decodeIPC(msg)
-			if err == nil && r != nil {
-				r.Release()
-				bytes = int64(len(msg))
-				return true, int64(rowCount), bytes
+			rowCount, err := decodeIPC(msg)
+			if err != nil {
+				break
 			}
-			return true, 0, 0
+			hasData = true
+			totalRows += int64(rowCount)
+			totalBytes += int64(len(msg))
 		}
 	}
+
+	return hasData, totalRows, totalBytes
 }
 
-func decodeIPC(data []byte) (arrow.Record, int, error) {
+func decodeIPC(data []byte) (int, error) {
 	reader, err := ipc.NewReader(bytes.NewReader(data))
 	if err != nil {
-		return nil, 0, err
+		return 0, err
 	}
 	defer reader.Release()
 
-	if !reader.Next() {
-		return nil, 0, nil
+	var totalRows int
+	for reader.Next() {
+		rec := reader.Record()
+		if rec != nil {
+			totalRows += int(rec.NumRows())
+			rec.Release()
+		}
 	}
 
-	rec := reader.Record()
-	if rec == nil {
-		return nil, 0, nil
-	}
-
-	return rec, int(rec.NumRows()), nil
+	return totalRows, reader.Err()
 }

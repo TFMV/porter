@@ -4,11 +4,12 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"os"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	"github.com/apache/arrow-adbc/go/adbc"
+	adbc_driver "github.com/apache/arrow-adbc/go/adbc"
 	"github.com/apache/arrow-adbc/go/adbc/drivermgr"
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
@@ -16,6 +17,8 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/memory"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+
+	"github.com/TFMV/porter/internal/adbc"
 )
 
 const (
@@ -42,6 +45,7 @@ type Config struct {
 	ReadOnly             bool
 	Logger               *slog.Logger
 	DevMode              bool
+	ADBCManager          *adbc.Manager
 }
 
 type Engine interface {
@@ -55,7 +59,7 @@ type Engine interface {
 }
 
 type engine struct {
-	db                 adbc.Database
+	db                 adbc_driver.Database
 	Alloc              memory.Allocator
 	Logger             *slog.Logger
 	schemaProbeTimeout time.Duration
@@ -68,18 +72,32 @@ type engine struct {
 }
 
 func New(cfg Config) (Engine, error) {
-	drv := drivermgr.Driver{}
-	dbPath := cfg.DBPath
-	if dbPath == "" {
-		dbPath = ":memory:"
-	}
-
 	logger := cfg.Logger
 	if logger == nil {
 		logger = slog.Default()
 	}
 
+	dbPath := cfg.DBPath
+	if dbPath == "" {
+		dbPath = ":memory:"
+	}
+
 	logger.Debug("initializing DuckDB database", slog.String("dbPath", dbPath), slog.Bool("readOnly", cfg.ReadOnly))
+
+	if cfg.ADBCManager != nil {
+		driverPath, err := cfg.ADBCManager.EnsureDriver("duckdb", "latest")
+		if err != nil {
+			return nil, fmt.Errorf("ensure duckdb driver: %w", err)
+		}
+		logger.Debug("resolved duckdb driver via manager", slog.String("path", driverPath))
+		existingPath := os.Getenv("ADBC_DRIVER_PATH")
+		if existingPath != "" {
+			driverPath = existingPath + string(os.PathListSeparator) + driverPath
+		}
+		os.Setenv("ADBC_DRIVER_PATH", driverPath)
+	}
+
+	drv := drivermgr.Driver{}
 
 	params := map[string]string{
 		"driver": "duckdb",

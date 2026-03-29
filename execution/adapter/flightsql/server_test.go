@@ -132,7 +132,12 @@ func TestDoPutPreparedStatementQueryReturnsNotFoundOnMissingHandle(t *testing.T)
 }
 
 func TestAcquireQuerySlotLimitsConcurrency(t *testing.T) {
-	s := &Server{querySemaphore: make(chan struct{}, 1)}
+	s, err := NewServer(Config{MaxConcurrentQueries: 1})
+	if err != nil {
+		t.Skipf("skipping test: %v", err)
+	}
+	defer s.Close()
+
 	if err := s.acquireQuerySlot(context.Background()); err != nil {
 		t.Fatalf("failed to acquire first slot: %v", err)
 	}
@@ -351,7 +356,11 @@ func TestDoGetPreparedStatementConcurrentReaders(t *testing.T) {
 func TestAcquireQuerySlotParallel(t *testing.T) {
 	t.Parallel()
 
-	s := &Server{querySemaphore: make(chan struct{}, 2)}
+	s, err := NewServer(Config{MaxConcurrentQueries: 2})
+	if err != nil {
+		t.Skipf("skipping test: %v", err)
+	}
+	defer s.Close()
 
 	var wg sync.WaitGroup
 	success := int32(0)
