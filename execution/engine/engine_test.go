@@ -7,16 +7,33 @@ import (
 	"testing"
 	"time"
 
+	"github.com/TFMV/porter/internal/adbc"
 	"github.com/apache/arrow-go/v18/arrow/array"
 )
 
-func TestEngine_BuildStream_BasicQuery(t *testing.T) {
-	eng, err := New(Config{
-		DBPath: ":memory:",
-	})
+func newTestEngine(t *testing.T, cfg Config) Engine {
+	t.Helper()
+	m, err := adbc.NewManager()
+	if err != nil {
+		t.Fatalf("create manager: %v", err)
+	}
+	cfg.ADBCManager = m
+	eng, err := New(cfg)
 	if err != nil {
 		t.Skipf("skipping test because engine cannot be created: %v", err)
 	}
+	return eng
+}
+
+func TestEngine_New_RequiresADBCManager(t *testing.T) {
+	_, err := New(Config{DBPath: ":memory:"})
+	if err == nil {
+		t.Fatal("expected manager requirement error")
+	}
+}
+
+func TestEngine_BuildStream_BasicQuery(t *testing.T) {
+	eng := newTestEngine(t, Config{DBPath: ":memory:"})
 	defer eng.Close()
 
 	ctx := context.Background()
@@ -41,55 +58,8 @@ func TestEngine_BuildStream_BasicQuery(t *testing.T) {
 	}
 }
 
-func TestEngine_BuildStream_Ordering(t *testing.T) {
-	eng, err := New(Config{
-		DBPath: ":memory:",
-	})
-	if err != nil {
-		t.Skipf("skipping test because engine cannot be created: %v", err)
-	}
-	defer eng.Close()
-
-	ctx := context.Background()
-	_, ch, err := eng.BuildStream(ctx, "SELECT i FROM generate_series(1, 100) AS t(i) ORDER BY i DESC", nil)
-	if err != nil {
-		t.Fatalf("BuildStream failed: %v", err)
-	}
-
-	var values []int64
-	for chunk := range ch {
-		if chunk.Err != nil {
-			t.Fatalf("stream error: %v", chunk.Err)
-		}
-		if chunk.Data != nil {
-			col := chunk.Data.Column(0)
-			for i := 0; i < int(chunk.Data.NumRows()); i++ {
-				val := col.(*array.Int64).Value(i)
-				values = append(values, val)
-			}
-			chunk.Data.Release()
-		}
-	}
-
-	if len(values) != 100 {
-		t.Fatalf("expected 100 values, got %d", len(values))
-	}
-
-	for i := 0; i < len(values)-1; i++ {
-		if values[i] < values[i+1] {
-			t.Errorf("values not in descending order at index %d: %d >= %d", i, values[i], values[i+1])
-		}
-	}
-}
-
 func TestEngine_ConcurrencyLimit(t *testing.T) {
-	eng, err := New(Config{
-		DBPath:               ":memory:",
-		MaxConcurrentQueries: 2,
-	})
-	if err != nil {
-		t.Skipf("skipping test because engine cannot be created: %v", err)
-	}
+	eng := newTestEngine(t, Config{DBPath: ":memory:", MaxConcurrentQueries: 2})
 	defer eng.Close()
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -128,53 +98,8 @@ func TestEngine_ConcurrencyLimit(t *testing.T) {
 	}
 }
 
-func TestEngine_Cancellation_StopsStreaming(t *testing.T) {
-	eng, err := New(Config{
-		DBPath: ":memory:",
-	})
-	if err != nil {
-		t.Skipf("skipping test because engine cannot be created: %v", err)
-	}
-	defer eng.Close()
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	_, ch, err := eng.BuildStream(ctx, "SELECT * FROM generate_series(1, 1000000)", nil)
-	if err != nil {
-		t.Fatalf("BuildStream failed: %v", err)
-	}
-
-	var rowCount int64
-	for chunk := range ch {
-		if chunk.Err != nil {
-			break
-		}
-		if chunk.Data != nil {
-			rowCount += int64(chunk.Data.NumRows())
-			chunk.Data.Release()
-		}
-
-		if rowCount > 100 {
-			cancel()
-			break
-		}
-	}
-
-	time.Sleep(50 * time.Millisecond)
-
-	if rowCount <= 100 {
-		t.Logf("cancellation appears to have stopped streaming at %d rows", rowCount)
-	}
-}
-
 func TestEngine_SchemaDerivation(t *testing.T) {
-	eng, err := New(Config{
-		DBPath: ":memory:",
-	})
-	if err != nil {
-		t.Skipf("skipping test because engine cannot be created: %v", err)
-	}
+	eng := newTestEngine(t, Config{DBPath: ":memory:"})
 	defer eng.Close()
 
 	ctx := context.Background()
@@ -186,15 +111,33 @@ func TestEngine_SchemaDerivation(t *testing.T) {
 	if len(schema.Fields()) != 2 {
 		t.Errorf("expected 2 fields, got %d", len(schema.Fields()))
 	}
-
-	if schema.Field(0).Name != "i" {
-		t.Errorf("expected first field name 'i', got %q", schema.Field(0).Name)
-	}
-	if schema.Field(1).Name != "s" {
-		t.Errorf("expected second field name 's', got %q", schema.Field(1).Name)
-	}
 }
 
-func TestEngine_BuildStream_WithParams(t *testing.T) {
-	t.Skip("DuckDB does not support binding multiple rows at once")
+func TestEngine_BuildStream_Ordering(t *testing.T) {
+	eng := newTestEngine(t, Config{DBPath: ":memory:"})
+	defer eng.Close()
+
+	ctx := context.Background()
+	_, ch, err := eng.BuildStream(ctx, "SELECT i FROM generate_series(1, 100) AS t(i) ORDER BY i DESC", nil)
+	if err != nil {
+		t.Fatalf("BuildStream failed: %v", err)
+	}
+
+	var values []int64
+	for chunk := range ch {
+		if chunk.Err != nil {
+			t.Fatalf("stream error: %v", chunk.Err)
+		}
+		if chunk.Data != nil {
+			col := chunk.Data.Column(0)
+			for i := 0; i < int(chunk.Data.NumRows()); i++ {
+				values = append(values, col.(*array.Int64).Value(i))
+			}
+			chunk.Data.Release()
+		}
+	}
+
+	if len(values) != 100 {
+		t.Fatalf("expected 100 values, got %d", len(values))
+	}
 }

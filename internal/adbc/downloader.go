@@ -11,8 +11,8 @@ import (
 	"strings"
 )
 
-func DownloadAndExtract(url string, destDir string) (string, error) {
-	resp, err := http.Get(url)
+func DownloadAndExtract(downloadURL string, destDir string) (string, error) {
+	resp, err := http.Get(downloadURL)
 	if err != nil {
 		return "", fmt.Errorf("download failed: %w", err)
 	}
@@ -22,13 +22,39 @@ func DownloadAndExtract(url string, destDir string) (string, error) {
 		return "", fmt.Errorf("bad status: %s", resp.Status)
 	}
 
-	if err := os.MkdirAll(destDir, 0o755); err != nil {
+	parent := filepath.Dir(destDir)
+	if err := os.MkdirAll(parent, 0o755); err != nil {
+		return "", err
+	}
+	tmpDir, err := os.MkdirTemp(parent, ".install-*")
+	if err != nil {
+		return "", fmt.Errorf("create temp dir: %w", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	driverPath, err := extractArchive(resp.Body, tmpDir)
+	if err != nil {
 		return "", err
 	}
 
-	gzr, err := gzip.NewReader(resp.Body)
+	if err := os.RemoveAll(destDir); err != nil && !os.IsNotExist(err) {
+		return "", fmt.Errorf("reset destination: %w", err)
+	}
+	if err := os.Rename(tmpDir, destDir); err != nil {
+		return "", fmt.Errorf("activate install: %w", err)
+	}
+
+	relPath, err := filepath.Rel(tmpDir, driverPath)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("resolve installed driver path: %w", err)
+	}
+	return filepath.Join(destDir, relPath), nil
+}
+
+func extractArchive(body io.Reader, destDir string) (string, error) {
+	gzr, err := gzip.NewReader(body)
+	if err != nil {
+		return "", fmt.Errorf("invalid gzip stream: %w", err)
 	}
 	defer gzr.Close()
 
@@ -42,12 +68,13 @@ func DownloadAndExtract(url string, destDir string) (string, error) {
 			break
 		}
 		if err != nil {
-			return "", err
+			return "", fmt.Errorf("invalid tar stream: %w", err)
 		}
 
-		// 🔐 prevent path traversal attacks
 		target := filepath.Join(destDir, hdr.Name)
-		if !strings.HasPrefix(filepath.Clean(target), filepath.Clean(destDir)) {
+		cleanTarget := filepath.Clean(target)
+		cleanDest := filepath.Clean(destDir)
+		if cleanTarget != cleanDest && !strings.HasPrefix(cleanTarget, cleanDest+string(os.PathSeparator)) {
 			return "", fmt.Errorf("illegal file path in archive: %s", hdr.Name)
 		}
 
@@ -78,6 +105,9 @@ func DownloadAndExtract(url string, destDir string) (string, error) {
 			}
 
 			if isDriverLib(target) {
+				if driverPath != "" {
+					return "", fmt.Errorf("multiple driver libraries found in archive")
+				}
 				driverPath = target
 			}
 		}

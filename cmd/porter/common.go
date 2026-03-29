@@ -3,9 +3,11 @@ package main
 import (
 	"context"
 	"fmt"
+	"os"
 	"strings"
 
-	"github.com/apache/arrow-adbc/go/adbc"
+	internaladbc "github.com/TFMV/porter/internal/adbc"
+	apacheadbc "github.com/apache/arrow-adbc/go/adbc"
 	"github.com/apache/arrow-adbc/go/adbc/drivermgr"
 	"github.com/spf13/viper"
 )
@@ -33,8 +35,27 @@ func normalizeDBPath(path string) string {
 	return path
 }
 
-func openDuckDBConnection(ctx context.Context, dbPath string) (adbc.Database, adbc.Connection, error) {
+func ensureADBCDefaultDriver() error {
+	manager, err := internaladbc.NewManager()
+	if err != nil {
+		return fmt.Errorf("initialize adbc manager: %w", err)
+	}
+	resolved, err := manager.EnsureDefaultDriver()
+	if err != nil {
+		return fmt.Errorf("ensure default adbc driver: %w", err)
+	}
+	if err := os.Setenv("ADBC_DRIVER_PATH", resolved.LibPath); err != nil {
+		return fmt.Errorf("set ADBC_DRIVER_PATH: %w", err)
+	}
+	return nil
+}
+
+func openDuckDBConnection(ctx context.Context, dbPath string) (apacheadbc.Database, apacheadbc.Connection, error) {
 	dbPath = normalizeDBPath(dbPath)
+
+	if err := ensureADBCDefaultDriver(); err != nil {
+		return nil, nil, err
+	}
 
 	var drv drivermgr.Driver
 
@@ -60,7 +81,7 @@ func openDuckDBConnection(ctx context.Context, dbPath string) (adbc.Database, ad
 	return adb, conn, nil
 }
 
-func withDuckDBConnection(ctx context.Context, dbPath string, fn func(adbc.Connection) error) error {
+func withDuckDBConnection(ctx context.Context, dbPath string, fn func(apacheadbc.Connection) error) error {
 	db, conn, err := openDuckDBConnection(ctx, dbPath)
 	if err != nil {
 		return err

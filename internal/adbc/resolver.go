@@ -4,11 +4,19 @@ import (
 	"fmt"
 	"net/url"
 	"os"
+	"path/filepath"
+	"sort"
 	"strings"
 )
 
 type Resolver struct {
 	BaseURL *url.URL
+}
+
+type InstalledDriver struct {
+	Name    string
+	Version string
+	LibPath string
 }
 
 func DefaultResolver() *Resolver {
@@ -29,7 +37,6 @@ func DefaultResolver() *Resolver {
 func (r *Resolver) Resolve(d Driver, version string, p Platform) (*url.URL, error) {
 	tuple := p.Tuple()
 
-	// FIX: remove duplicate "drivers/" prefix
 	path := fmt.Sprintf(
 		"%s/%s/%s_%s-%s.tar.gz",
 		d.Name,
@@ -43,4 +50,54 @@ func (r *Resolver) Resolve(d Driver, version string, p Platform) (*url.URL, erro
 	u.Path = strings.TrimRight(u.Path, "/") + "/" + path
 
 	return &u, nil
+}
+
+func (r *Resolver) DiscoverInstalled(cacheDir string, p Platform) ([]InstalledDriver, error) {
+	platformDir := filepath.Join(cacheDir)
+	driverEntries, err := os.ReadDir(platformDir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("read cache dir: %w", err)
+	}
+
+	var installed []InstalledDriver
+	tuple := p.Tuple()
+	for _, driverEntry := range driverEntries {
+		if !driverEntry.IsDir() {
+			continue
+		}
+		driverName := driverEntry.Name()
+		versionsDir := filepath.Join(cacheDir, driverName)
+		versionEntries, err := os.ReadDir(versionsDir)
+		if err != nil {
+			continue
+		}
+
+		for _, versionEntry := range versionEntries {
+			if !versionEntry.IsDir() {
+				continue
+			}
+			version := versionEntry.Name()
+			driverDir := filepath.Join(versionsDir, version, tuple)
+			lib, err := findDriverLib(driverDir)
+			if err != nil {
+				continue
+			}
+			installed = append(installed, InstalledDriver{Name: driverName, Version: version, LibPath: lib})
+		}
+	}
+
+	sort.Slice(installed, func(i, j int) bool {
+		if installed[i].Name != installed[j].Name {
+			return installed[i].Name < installed[j].Name
+		}
+		if installed[i].Version != installed[j].Version {
+			return installed[i].Version < installed[j].Version
+		}
+		return installed[i].LibPath < installed[j].LibPath
+	})
+
+	return installed, nil
 }
