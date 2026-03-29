@@ -91,6 +91,18 @@ Defaults:
 
 ---
 
+## Prerequisites
+
+Install dbc and required ADBC drivers:
+
+```bash
+curl -LsSf https://dbc.columnar.tech/install.sh | sh
+dbc install duckdb
+dbc install flightsql
+```
+
+---
+
 ### ⚙️ Option 2 — Install via `go install`
 
 #### 1. Install Porter
@@ -100,26 +112,6 @@ go install github.com/TFMV/porter/cmd/porter@latest
 ```
 
 This installs `porter` into your `$GOBIN`.
-
-#### 2. Install ADBC CLI (dbc)
-
-```bash
-curl -LsSf https://dbc.columnar.tech/install.sh | sh
-```
-
-#### 3. Install DuckDB ADBC driver
-
-```bash
-dbc install duckdb
-```
-
-Verify installation:
-
-```bash
-dbc list
-```
-
-You should see `duckdb` listed.
 
 ---
 
@@ -132,13 +124,7 @@ git clone https://github.com/TFMV/porter.git
 cd porter
 ```
 
-#### 2. Install DuckDB ADBC driver
-
-```bash
-./install_duckdb.sh
-```
-
-#### 3. Run
+#### 2. Run
 
 ```bash
 go run ./cmd/porter serve

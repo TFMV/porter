@@ -3,101 +3,70 @@ package adbc
 import (
 	"os"
 	"path/filepath"
-	"sync"
-	"sync/atomic"
+	"strings"
 	"testing"
 )
 
-func testManager(t *testing.T, download downloaderFunc) *Manager {
+func testManager(t *testing.T) *Manager {
 	t.Helper()
 	return &Manager{
-		CacheDir:   t.TempDir(),
-		Resolver:   DefaultResolver(),
-		installers: make(map[string]*sync.Mutex),
-		download:   download,
+		CacheDir: t.TempDir(),
+		Resolver: DefaultResolver(),
 	}
 }
 
-func TestManager_EnsureDriver_Idempotent_Concurrent(t *testing.T) {
-	var downloads int32
-	m := testManager(t, func(_ string, destDir string) (string, error) {
-		atomic.AddInt32(&downloads, 1)
-		if err := os.MkdirAll(destDir, 0o755); err != nil {
-			return "", err
+func TestManager_EnsureRequiredDrivers(t *testing.T) {
+	m := testManager(t)
+	tuple := CurrentPlatform().Tuple()
+
+	mustWrite := func(path string) {
+		t.Helper()
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
 		}
-		lib := filepath.Join(destDir, "libduckdb.so")
-		if err := os.WriteFile(lib, []byte("ok"), 0o644); err != nil {
-			return "", err
-		}
-		return lib, nil
-	})
-
-	var wg sync.WaitGroup
-	results := make(chan string, 20)
-	errCh := make(chan error, 20)
-
-	for i := 0; i < 20; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			lib, err := m.EnsureDriver("duckdb", "latest")
-			if err != nil {
-				errCh <- err
-				return
-			}
-			results <- lib
-		}()
-	}
-	wg.Wait()
-	close(results)
-	close(errCh)
-
-	for err := range errCh {
-		t.Fatalf("EnsureDriver failed: %v", err)
-	}
-
-	var first string
-	for lib := range results {
-		if first == "" {
-			first = lib
-			continue
-		}
-		if lib != first {
-			t.Fatalf("expected deterministic path, got %q and %q", first, lib)
+		if err := os.WriteFile(path, []byte("ok"), 0o644); err != nil {
+			t.Fatal(err)
 		}
 	}
 
-	if got := atomic.LoadInt32(&downloads); got != 1 {
-		t.Fatalf("expected one download, got %d", got)
-	}
-}
+	mustWrite(filepath.Join(m.CacheDir, "duckdb", "latest", tuple, "libduckdb.so"))
+	mustWrite(filepath.Join(m.CacheDir, "flightsql", "latest", tuple, "libflightsql.so"))
 
-func TestManager_EnsureDriver_RepairsPartialInstall(t *testing.T) {
-	m := testManager(t, func(_ string, destDir string) (string, error) {
-		lib := filepath.Join(destDir, "libduckdb.so")
-		if err := os.MkdirAll(destDir, 0o755); err != nil {
-			return "", err
-		}
-		if err := os.WriteFile(lib, []byte("ok"), 0o644); err != nil {
-			return "", err
-		}
-		return lib, nil
-	})
-
-	platform := CurrentPlatform().Tuple()
-	partialDir := filepath.Join(m.CacheDir, "duckdb", "latest", platform)
-	if err := os.MkdirAll(partialDir, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(partialDir, "README.txt"), []byte("partial"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-
-	lib, err := m.EnsureDriver("duckdb", "latest")
+	resolved, err := m.EnsureRequiredDrivers()
 	if err != nil {
+		t.Fatalf("EnsureRequiredDrivers failed: %v", err)
+	}
+	if _, ok := resolved["duckdb"]; !ok {
+		t.Fatal("expected duckdb driver")
+	}
+	if _, ok := resolved["flightsql"]; !ok {
+		t.Fatal("expected flightsql driver")
+	}
+}
+
+func TestManager_EnsureRequiredDrivers_MissingSingle(t *testing.T) {
+	m := testManager(t)
+	tuple := CurrentPlatform().Tuple()
+	lib := filepath.Join(m.CacheDir, "duckdb", "latest", tuple, "libduckdb.so")
+	if err := os.MkdirAll(filepath.Dir(lib), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if filepath.Base(lib) != "libduckdb.so" {
-		t.Fatalf("unexpected library path: %s", lib)
+	if err := os.WriteFile(lib, []byte("ok"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := m.EnsureRequiredDrivers()
+	if err == nil {
+		t.Fatal("expected missing driver error")
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, "- flightsql") {
+		t.Fatalf("expected flightsql in message, got %q", msg)
+	}
+	if strings.Contains(msg, "dbc install duckdb") {
+		t.Fatalf("did not expect duckdb install hint in message, got %q", msg)
+	}
+	if !strings.Contains(msg, "dbc install flightsql") {
+		t.Fatalf("expected flightsql install hint in message, got %q", msg)
 	}
 }
