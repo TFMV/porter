@@ -16,6 +16,7 @@ import (
 var (
 	scaleFlag = flag.Float64("scale", 0.1, "TPC-H scale factor (SF). Common values: 0.1, 1, 10, 100")
 	regenFlag = flag.Bool("regen", true, "Run CALL dbgen to (re)generate the dataset")
+	portFlag  = flag.String("port", "32010", "FlightSQL server port")
 )
 
 func main() {
@@ -29,7 +30,7 @@ func main() {
 	var drv drivermgr.Driver
 	db, err := drv.NewDatabase(map[string]string{
 		"driver": "flightsql",
-		"uri":    "grpc+tcp://127.0.0.1:32010",
+		"uri":    "grpc+tcp://127.0.0.1:" + *portFlag,
 	})
 	if err != nil {
 		log.Fatal(err)

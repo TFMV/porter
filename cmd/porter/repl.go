@@ -48,7 +48,7 @@ func runRepl(cfg porterConfig) error {
 		}
 
 		trimmed := strings.TrimSpace(line)
-		if trimmed == ".exit" {
+		if trimmed == ".exit" || trimmed == ".exit;" {
 			return nil
 		}
 
@@ -56,9 +56,6 @@ func runRepl(cfg porterConfig) error {
 		if strings.HasSuffix(strings.TrimSpace(line), ";") {
 			sql := strings.TrimSpace(buffer.String())
 			buffer.Reset()
-			if sql == ".exit;" {
-				return nil
-			}
 
 			if err := executeReplStatement(ctx, conn, sql); err != nil {
 				fmt.Fprintf(os.Stderr, "error: %v\n", err)

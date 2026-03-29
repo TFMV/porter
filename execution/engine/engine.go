@@ -19,7 +19,6 @@ import (
 )
 
 const (
-	handleSize                = 16
 	defaultSchemaProbeTimeout = 5 * time.Second
 )
 
@@ -318,6 +317,11 @@ func (e *engine) ExecuteUpdate(ctx context.Context, sql string) (int64, error) {
 	ctx, finishQuery := e.trackQuery(ctx)
 	defer finishQuery()
 
+	if err := e.AcquireQuerySlot(ctx); err != nil {
+		return 0, err
+	}
+	defer e.ReleaseQuerySlot()
+
 	conn, err := e.db.Open(ctx)
 	if err != nil {
 		return 0, wrapInternal(err, "open db connection")
@@ -390,6 +394,9 @@ type BatchGuard struct {
 }
 
 func NewBatchGuard(b arrow.RecordBatch) *BatchGuard {
+	if b == nil {
+		return nil
+	}
 	return &BatchGuard{batch: b}
 }
 
