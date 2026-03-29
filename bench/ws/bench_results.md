@@ -1,109 +1,68 @@
-# WebSocket Benchmark Results
+# Transport Benchmark Report (WebSocket vs Flight SQL)
 
-## Test Configuration
+## What was changed
 
-- **Server**: Porter with WebSocket transport
-- **Database**: In-memory (generate_series queries)
-- **Query**: `SELECT i, 'value_' || i as text FROM generate_series(1, 1000) as t(i)`
+This report now uses a **single benchmark harness** (`bench/transport/main.go`) that runs identical SQL workloads against both transports and reports:
 
-## Results
+- throughput (rows/sec + payload MB/sec)
+- latency (p50/p95/p99)
+- first-byte latency
+- batching behavior (batches/query)
+- decode cost and read-time ratios
+- optional CPU/heap profiles for pprof (`--cpu-profile`, `--heap-profile`)
 
-### Final Results (Continuous Streaming + No Compression)
+## Benchmark integrity fixes
 
-```
-=== WebSocket Benchmark (4 clients) ===
-Total Requests:     15,822
-Successful:         15,811
-Errors:            11
-Total Rows:        15,811,000
-Total Bytes:       321.11 MB
-Duration:          5.233s
-Requests/sec:      3,023.77
-Rows/sec:          3,021,672.42
-Throughput:        61.37 MB/s
-```
+The previous comparison was not apples-to-apples:
 
-### Before Optimizations (Reference)
+1. **Different workloads** (WebSocket used `generate_series`, Flight used TPC-H lineitem scan).
+2. **Connection lifecycle mismatch** (WebSocket benchmark established a new socket per query).
+3. **Different benchmark clients and output metrics**.
 
-| Configuration | Rows/sec | MB/sec |
-|---------------|----------|--------|
-| Original (per-batch IPC) | 2.3M | 47 |
-| + Continuous streaming | 2.3M | 47 |
-| + No compression | 3.0M | 61 |
+The new harness removes those mismatches by using the same query text, concurrency, iteration count, and result accounting for both transports.
 
-### FlightSQL Benchmark (for comparison)
+## Root-cause bottlenecks identified
 
-```
-=== Throughput Results ===
-Rows:        662,426,242
-Batches:     323,455
-Time:        23.89s
-Rows/sec:    27,722,511.42
-MB/sec:      1,269.04
-```
+### WebSocket bottlenecks
 
-## Comparison
+1. **Per-query connection setup overhead** in benchmark/client behavior.
+2. **Many small writes from Arrow IPC writer into WebSocket writer**, increasing syscall and framing overhead.
+3. **Connection forced closed after each query** in server path, preventing request multiplexing/reuse on one socket.
 
-| Metric | FlightSQL | WebSocket (4 clients) | Gap |
-|--------|-----------|----------------------|-----|
-| Rows/sec | 27.7M | 3.0M | ~9x |
-| MB/sec | 1,269 | 61 | ~21x |
+### Flight behavior baseline
 
-## Optimizations Applied
+Flight SQL/gRPC already streams efficiently with persistent connections and optimized backpressure in gRPC transport.
 
-### 1. Continuous IPC Streaming
-- Single IPC writer writes directly to WebSocket connection
-- Zero-copy streaming from Arrow to WebSocket
-- Single WebSocket message per query
+## Optimizations implemented
 
-```go
-// Before: New IPC writer per batch
-func encodeArrowBatch(schema, batch) {
-    w := ipc.NewWriter(&buf, ipc.WithSchema(schema))
-    w.Write(batch)
-    w.Close()
-    conn.Write(buf.Bytes())
-}
+1. **Persistent WebSocket session support in server**
+   - Server now handles multiple query requests on one connection.
+2. **Buffered Arrow IPC write path for WebSocket**
+   - Added `bufio.Writer` (1 MiB buffer).
+   - Flushes periodically to coalesce writes (`8` batches) and reduce small-frame churn.
+3. **Unified transport benchmark harness**
+   - Added `bench/transport/main.go` with identical workload execution for ws/flight.
+   - Added batch-size sensitivity mode (`--batch-sizes`).
+   - Added pprof artifact support (`--cpu-profile`, `--heap-profile`).
 
-// After: Continuous streaming
-wsWriter, _ := h.conn.Writer(ctx, websocket.MessageBinary)
-ipcWriter := ipc.NewWriter(wsWriter, ipc.WithSchema(schema))
-for chunk := range streamCh {
-    ipcWriter.Write(chunk.Data)
-}
-ipcWriter.Close()
-wsWriter.Close()
-```
-
-### 2. Disabled WebSocket Compression
-- Arrow IPC is already compressed internally
-- Adding WS compression was redundant and CPU-intensive
-- **Impact: ~30% performance improvement**
-
-```go
-// Before: Compression enabled
-CompressionMode: websocket.CompressionContextTakeover,
-
-// After: No compression (Arrow IPC handles it)
-```
-
-## Performance Analysis
-
-The remaining ~9x gap vs FlightSQL is due to:
-1. **Protocol overhead**: WebSocket adds HTTP framing on top of TCP
-2. **Connection per query**: Benchmark creates new connection each request
-3. **gRPC streaming**: FlightSQL uses persistent connections with efficient streaming
-4. **No connection reuse**: Each query does HTTP upgrade handshake
-
-## Usage
+## How to run
 
 ```bash
-# Start server with WebSocket
-go run ./cmd/porter serve --ws --ws-port 8080
+# Start Porter with both transports enabled
+go run ./cmd/porter serve --ws --ws-port 8080 --port 32010 --db :memory:
 
-# Run WebSocket benchmark
-go run ./bench/ws/main.go --port 8080 --clients 4 --duration 10
+# Throughput + latency, identical query, both transports
+go run ./bench/transport/main.go --transport both --clients 2 --iterations 5
 
-# Run FlightSQL benchmark
-go run ./bench/porter/main.go -port 32010 -regen=false
+# Batch-size sensitivity sweep
+go run ./bench/transport/main.go --transport both --clients 2 --iterations 3 --batch-sizes 100000,500000,1000000,2000000
+
+# With pprof artifacts
+go run ./bench/transport/main.go --transport ws --clients 2 --iterations 5 --cpu-profile ws_cpu.pprof --heap-profile ws_heap.pprof
 ```
+
+## Remaining gaps to investigate (if needed)
+
+- Eliminate text schema side-channel in ws protocol (Arrow stream already includes schema metadata).
+- Add optional binary metadata/control frames for query-complete markers and errors.
+- Reuse Flight client/connection object in benchmark hot loop to isolate server-side deltas even further.

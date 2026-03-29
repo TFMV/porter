@@ -1,6 +1,7 @@
 package ws
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"io"
@@ -67,82 +68,117 @@ type streamHandler struct {
 }
 
 func (h *streamHandler) serve(ctx context.Context) {
-	var req QueryRequest
-	readCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-	err := wsjson.Read(readCtx, h.conn, &req)
-	cancel()
-	if err != nil {
-		h.close(websocket.StatusUnsupportedData, "invalid request")
-		return
-	}
-	if req.Query == "" {
-		h.close(websocket.StatusUnsupportedData, "empty query")
-		return
-	}
+	for {
+		var req QueryRequest
+		readCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		err := wsjson.Read(readCtx, h.conn, &req)
+		cancel()
+		if err != nil {
+			if websocket.CloseStatus(err) == websocket.StatusNormalClosure || errors.Is(err, io.EOF) || errors.Is(err, context.Canceled) {
+				h.close(websocket.StatusNormalClosure, "client disconnected")
+			} else {
+				h.close(websocket.StatusUnsupportedData, "invalid request")
+			}
+			return
+		}
+		if req.Query == "" {
+			h.close(websocket.StatusUnsupportedData, "empty query")
+			return
+		}
 
-	execCtx, cancelExec := context.WithCancel(ctx)
-	defer cancelExec()
+		execCtx, cancelExec := context.WithCancel(ctx)
+		if err := h.engine.AcquireQuerySlot(execCtx); err != nil {
+			cancelExec()
+			h.close(websocket.StatusPolicyViolation, "too many concurrent queries")
+			return
+		}
 
-	if err := h.engine.AcquireQuerySlot(execCtx); err != nil {
-		h.close(websocket.StatusPolicyViolation, "too many concurrent queries")
-		return
+		schema, streamCh, err := h.engine.BuildStream(execCtx, req.Query, nil)
+		if err != nil {
+			h.engine.ReleaseQuerySlot()
+			cancelExec()
+			h.logger.Error("build stream failed", slog.Any("err", err))
+			h.close(websocket.StatusInternalError, "execution failed")
+			return
+		}
+
+		if err := h.sendSchema(execCtx, schema); err != nil {
+			h.engine.ReleaseQuerySlot()
+			cancelExec()
+			return
+		}
+
+		if err := h.streamBatches(execCtx, schema, streamCh); err != nil {
+			h.engine.ReleaseQuerySlot()
+			cancelExec()
+			return
+		}
+
+		h.engine.ReleaseQuerySlot()
+		cancelExec()
 	}
-	defer h.engine.ReleaseQuerySlot()
-
-	schema, streamCh, err := h.engine.BuildStream(execCtx, req.Query, nil)
-	if err != nil {
-		h.logger.Error("build stream failed", slog.Any("err", err))
-		h.close(websocket.StatusInternalError, "execution failed")
-		return
-	}
-
-	if err := h.sendSchema(execCtx, schema); err != nil {
-		return
-	}
-
-	h.streamBatches(execCtx, schema, streamCh)
 }
 
-func (h *streamHandler) streamBatches(ctx context.Context, schema *arrow.Schema, streamCh <-chan engine.StreamChunk) {
+func (h *streamHandler) streamBatches(ctx context.Context, schema *arrow.Schema, streamCh <-chan engine.StreamChunk) error {
 	wsWriter, err := h.conn.Writer(ctx, websocket.MessageBinary)
 	if err != nil {
 		h.handleWriteError(err)
-		return
+		return err
 	}
+	buffered := bufio.NewWriterSize(wsWriter, 1<<20)
 
-	ipcWriter := ipc.NewWriter(wsWriter, ipc.WithSchema(schema))
+	ipcWriter := ipc.NewWriter(buffered, ipc.WithSchema(schema))
+	pendingBatches := 0
+
+	closeWriters := func() error {
+		if err := ipcWriter.Close(); err != nil {
+			return err
+		}
+		if err := buffered.Flush(); err != nil {
+			return err
+		}
+		return wsWriter.Close()
+	}
 
 	for {
 		select {
 		case <-ctx.Done():
-			ipcWriter.Close()
-			wsWriter.Close()
+			_ = closeWriters()
 			h.close(websocket.StatusNormalClosure, "cancelled")
-			return
+			return ctx.Err()
 
 		case chunk, ok := <-streamCh:
 			if !ok {
-				ipcWriter.Close()
-				wsWriter.Close()
-				h.close(websocket.StatusNormalClosure, "done")
-				return
+				if err := closeWriters(); err != nil {
+					h.handleWriteError(err)
+					return err
+				}
+				return nil
 			}
 			if chunk.Err != nil {
-				ipcWriter.Close()
-				wsWriter.Close()
+				_ = closeWriters()
 				h.logger.Error("stream error", slog.Any("err", chunk.Err))
 				h.close(websocket.StatusInternalError, "stream error")
-				return
+				return chunk.Err
 			}
 			if chunk.Data == nil {
 				continue
 			}
 
 			if err := ipcWriter.Write(chunk.Data); err != nil {
-				ipcWriter.Close()
-				wsWriter.Close()
+				chunk.Data.Release()
+				_ = closeWriters()
 				h.close(websocket.StatusInternalError, "write error")
-				return
+				return err
+			}
+			pendingBatches++
+			if pendingBatches >= 8 {
+				if err := buffered.Flush(); err != nil {
+					_ = closeWriters()
+					h.handleWriteError(err)
+					return err
+				}
+				pendingBatches = 0
 			}
 			chunk.Data.Release()
 		}
