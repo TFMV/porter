@@ -2,6 +2,7 @@ package engine
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -38,6 +39,14 @@ func wrapInternal(err error, msg string) error {
 	return status.Errorf(codes.Internal, "%s: %v", msg, err)
 }
 
+func isInvalidArgument(err error) bool {
+	var adbcErr adbc_driver.Error
+	if ok := errors.As(err, &adbcErr); !ok {
+		return false
+	}
+	return adbcErr.Code == adbc_driver.StatusInvalidArgument
+}
+
 type Config struct {
 	DBPath               string
 	MaxConcurrentQueries int
@@ -69,6 +78,7 @@ type engine struct {
 	activeQueries   map[int64]context.CancelFunc
 	activeQueriesMu sync.Mutex
 	nextQueryID     int64
+	closeOnce       sync.Once
 }
 
 func New(cfg Config) (Engine, error) {
@@ -147,10 +157,27 @@ func (e *engine) Allocator() memory.Allocator {
 }
 
 func (e *engine) Close() error {
-	if e.db != nil {
-		return e.db.Close()
-	}
-	return nil
+	var closeErr error
+	e.closeOnce.Do(func() {
+		e.activeQueriesMu.Lock()
+		cancellers := make([]context.CancelFunc, 0, len(e.activeQueries))
+		for _, cancel := range e.activeQueries {
+			cancellers = append(cancellers, cancel)
+		}
+		e.activeQueriesMu.Unlock()
+
+		for _, cancel := range cancellers {
+			cancel()
+		}
+
+		e.activeOps.Wait()
+
+		if e.db != nil {
+			closeErr = e.db.Close()
+			e.db = nil
+		}
+	})
+	return closeErr
 }
 
 func (e *engine) trackQuery(ctx context.Context) (context.Context, func()) {
@@ -286,7 +313,10 @@ func (e *engine) BuildStream(
 		stmt.Close()
 		conn.Close()
 		abort()
-		return nil, nil, ErrInvalidSQL
+		if isInvalidArgument(err) {
+			return nil, nil, ErrInvalidSQL
+		}
+		return nil, nil, wrapInternal(err, "set sql query")
 	}
 
 	if params != nil {
@@ -354,7 +384,10 @@ func (e *engine) ExecuteUpdate(ctx context.Context, sql string) (int64, error) {
 	defer stmt.Close()
 
 	if err := stmt.SetSqlQuery(sql); err != nil {
-		return 0, ErrInvalidSQL
+		if isInvalidArgument(err) {
+			return 0, ErrInvalidSQL
+		}
+		return 0, wrapInternal(err, "set sql query")
 	}
 	return stmt.ExecuteUpdate(ctx)
 }

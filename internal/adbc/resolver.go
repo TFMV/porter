@@ -62,7 +62,10 @@ func (r *Resolver) DiscoverInstalled(cacheDir string, p Platform) ([]InstalledDr
 }
 
 func (r *Resolver) discoverFromDir(baseDir string, p Platform) ([]InstalledDriver, error) {
-	tuple := p.Tuple()
+	tuple, err := p.tuple()
+	if err != nil {
+		return nil, err
+	}
 	var installed []InstalledDriver
 
 	entries, err := os.ReadDir(baseDir)
@@ -119,12 +122,9 @@ func (r *Resolver) discoverFromDir(baseDir string, p Platform) ([]InstalledDrive
 				driverName, version := extractNameAndVersion(driverName)
 				installed = append(installed, InstalledDriver{Name: driverName, Version: version, LibPath: lib})
 			}
-		} else {
-			lib, err := findDriverLib(driverPath)
-			if err != nil {
-				continue
-			}
-			installed = append(installed, InstalledDriver{Name: driverName, Version: "installed", LibPath: lib})
+		} else if isDriverLib(entry.Name()) {
+			driverName, version := extractNameAndVersion(strings.TrimSuffix(entry.Name(), filepath.Ext(entry.Name())))
+			installed = append(installed, InstalledDriver{Name: driverName, Version: version, LibPath: driverPath})
 		}
 	}
 
@@ -137,7 +137,7 @@ func extractNameAndVersion(dirName string) (string, string) {
 
 	for i := len(dirName) - 1; i >= 0; i-- {
 		if dirName[i] == '_' || dirName[i] == '-' {
-			if i > 0 && (dirName[i-1] >= '0' && dirName[i-1] <= '9') {
+			if i+1 < len(dirName) && dirName[i+1] >= '0' && dirName[i+1] <= '9' {
 				version = dirName[i+1:]
 				driverName = dirName[:i]
 				break

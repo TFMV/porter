@@ -87,15 +87,9 @@ func (h *streamHandler) serve(ctx context.Context) {
 		}
 
 		execCtx, cancelExec := context.WithCancel(ctx)
-		if err := h.engine.AcquireQuerySlot(execCtx); err != nil {
-			cancelExec()
-			h.close(websocket.StatusPolicyViolation, "too many concurrent queries")
-			return
-		}
 
 		schema, streamCh, err := h.engine.BuildStream(execCtx, req.Query, nil)
 		if err != nil {
-			h.engine.ReleaseQuerySlot()
 			cancelExec()
 			h.logger.Error("build stream failed", slog.Any("err", err))
 			h.close(websocket.StatusInternalError, "execution failed")
@@ -103,18 +97,15 @@ func (h *streamHandler) serve(ctx context.Context) {
 		}
 
 		if err := h.sendSchema(execCtx, schema); err != nil {
-			h.engine.ReleaseQuerySlot()
 			cancelExec()
 			return
 		}
 
 		if err := h.streamBatches(execCtx, schema, streamCh); err != nil {
-			h.engine.ReleaseQuerySlot()
 			cancelExec()
 			return
 		}
 
-		h.engine.ReleaseQuerySlot()
 		cancelExec()
 		h.close(websocket.StatusNormalClosure, "query complete")
 	}

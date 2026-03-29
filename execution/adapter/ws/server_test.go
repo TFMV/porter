@@ -27,31 +27,25 @@ type fakeEngine struct {
 	acquireErr error
 	schema     *arrow.Schema
 	ch         chan flight.StreamChunk
-	acquired   atomic.Int32
-	released   atomic.Int32
-	// Added: A signal channel to notify the test when release is DONE
-	releaseNotify chan struct{}
+	buildErr   error
+	buildCalls atomic.Int32
 }
 
 func (f *fakeEngine) AcquireQuerySlot(ctx context.Context) error {
 	if f.acquireErr != nil {
 		return f.acquireErr
 	}
-	f.acquired.Add(1)
 	return nil
 }
 
 func (f *fakeEngine) ReleaseQuerySlot() {
-	f.released.Add(1)
-	if f.releaseNotify != nil {
-		select {
-		case f.releaseNotify <- struct{}{}:
-		default:
-		}
-	}
 }
 
 func (f *fakeEngine) BuildStream(ctx context.Context, sql string, params arrow.RecordBatch) (*arrow.Schema, <-chan engine.StreamChunk, error) {
+	f.buildCalls.Add(1)
+	if f.buildErr != nil {
+		return nil, nil, f.buildErr
+	}
 	return f.schema, f.ch, nil
 }
 
@@ -157,9 +151,9 @@ func TestServer_StreamSuccess_Full(t *testing.T) {
 	}
 }
 
-func TestServer_ConcurrentSlotRejection(t *testing.T) {
+func TestServer_BuildStreamErrorClosesConnection(t *testing.T) {
 	eng := &fakeEngine{
-		acquireErr: errors.New("limit"),
+		buildErr: errors.New("limit"),
 		schema: arrow.NewSchema([]arrow.Field{
 			{Name: "id", Type: arrow.PrimitiveTypes.Int32},
 		}, nil),
@@ -176,18 +170,16 @@ func TestServer_ConcurrentSlotRejection(t *testing.T) {
 
 	_, _, err := c.Read(context.Background())
 	if err == nil {
-		t.Fatal("expected rejection close")
+		t.Fatal("expected close on build failure")
 	}
 }
 
-func TestServer_EngineSlotLifecycle(t *testing.T) {
-	notify := make(chan struct{}, 1)
+func TestServer_ExecutesExactlyOneBuildPerQuery(t *testing.T) {
 	eng := &fakeEngine{
 		schema: arrow.NewSchema([]arrow.Field{
 			{Name: "id", Type: arrow.PrimitiveTypes.Int32},
 		}, nil),
-		ch:            make(chan flight.StreamChunk),
-		releaseNotify: notify,
+		ch: make(chan flight.StreamChunk),
 	}
 
 	ts := newTestServer(t, eng)
@@ -219,19 +211,7 @@ func TestServer_EngineSlotLifecycle(t *testing.T) {
 	// 4. Close the data channel to finish the stream
 	close(eng.ch)
 
-	// 5. Wait for the server to actually call ReleaseQuerySlot
-	select {
-	case <-notify:
-		// Success: The defer has executed
-	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for ReleaseQuerySlot to be called")
-	}
-
-	// 6. Final assertions
-	if eng.acquired.Load() != 1 {
-		t.Errorf("expected acquire=1 got %d", eng.acquired.Load())
-	}
-	if eng.released.Load() != 1 {
-		t.Errorf("expected release=1 got %d", eng.released.Load())
+	if eng.buildCalls.Load() != 1 {
+		t.Errorf("expected build calls=1 got %d", eng.buildCalls.Load())
 	}
 }

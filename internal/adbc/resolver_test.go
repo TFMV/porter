@@ -44,3 +44,28 @@ func TestResolver_DiscoverInstalled_Deterministic(t *testing.T) {
 		t.Fatalf("unexpected third driver: %+v", installed[2])
 	}
 }
+
+func TestResolver_DiscoverInstalled_DriverLibAtRoot(t *testing.T) {
+	os.Unsetenv("ADBC_DRIVER_PATH")
+	r := DefaultResolver()
+	cache := t.TempDir()
+
+	lib := filepath.Join(cache, "duckdb-1.2.3.so")
+	if err := os.WriteFile(lib, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	installed, err := r.DiscoverInstalled(cache, Platform{OS: "linux", Arch: "amd64"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(installed) != 1 {
+		t.Fatalf("expected 1 installed driver, got %d", len(installed))
+	}
+	if installed[0].Name != "duckdb" {
+		t.Fatalf("expected driver name duckdb, got %q", installed[0].Name)
+	}
+	if installed[0].LibPath != lib {
+		t.Fatalf("expected path %q, got %q", lib, installed[0].LibPath)
+	}
+}
