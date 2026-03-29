@@ -63,47 +63,11 @@ func wrapInternal(err error, msg string) error {
 
 // ─── LIFECYCLE & OWNERSHIP ────────────────────────────────────────────────────
 
-// BatchGuard provides deterministic ownership of an Arrow RecordBatch.
-// It ensures that a batch is released exactly once, preventing double-frees
-// and memory leaks on early returns, evictions, or overwrites.
-type BatchGuard struct {
-	mu    sync.Mutex
-	batch arrow.RecordBatch
-}
+// BatchGuard is an alias for the engine's BatchGuard for backward compatibility.
+type BatchGuard = engine.BatchGuard
 
-func NewBatchGuard(b arrow.RecordBatch) *BatchGuard {
-	// Caller must transfer ownership to the guard. Do not Release the batch after
-	// calling NewBatchGuard; the guard is responsible for releasing it exactly once.
-	return &BatchGuard{batch: b}
-}
-
-// Release drops the reference safely. It is idempotent.
-func (g *BatchGuard) Release() {
-	if g == nil {
-		return
-	}
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	if g.batch != nil {
-		g.batch.Release()
-		g.batch = nil
-	}
-}
-
-// Retain returns the underlying batch and increments its reference count.
-// The caller is now responsible for releasing the returned batch.
-func (g *BatchGuard) Retain() arrow.RecordBatch {
-	if g == nil {
-		return nil
-	}
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	if g.batch != nil {
-		g.batch.Retain()
-		return g.batch
-	}
-	return nil
-}
+// NewBatchGuard is an alias for the engine's NewBatchGuard for backward compatibility.
+var NewBatchGuard = engine.NewBatchGuard
 
 // ─── HANDLE TYPES ─────────────────────────────────────────────────────────────
 

@@ -137,9 +137,7 @@ func (h *streamHandler) serve(ctx context.Context) {
 				return
 			}
 
-			writeCtx, cancelWrite := context.WithTimeout(execCtx, 5*time.Second)
-			err = h.conn.Write(writeCtx, websocket.MessageBinary, frame)
-			cancelWrite()
+			err = h.conn.Write(execCtx, websocket.MessageBinary, frame)
 
 			if err != nil {
 				if errors.Is(err, io.EOF) || errors.Is(err, context.Canceled) {
