@@ -1,7 +1,6 @@
 package ws
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"io"
@@ -27,7 +26,6 @@ type Server struct {
 	Engine         Engine
 	Logger         *slog.Logger
 	OriginPatterns []string
-	BatchSize      int
 }
 
 func NewServer(engine Engine, logger *slog.Logger, origins ...string) *Server {
@@ -41,14 +39,12 @@ func NewServer(engine Engine, logger *slog.Logger, origins ...string) *Server {
 		Engine:         engine,
 		Logger:         logger,
 		OriginPatterns: origins,
-		BatchSize:      100,
 	}
 }
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
-		OriginPatterns:  s.OriginPatterns,
-		CompressionMode: websocket.CompressionContextTakeover,
+		OriginPatterns: s.OriginPatterns,
 	})
 	if err != nil {
 		s.Logger.Error("websocket upgrade failed", slog.Any("err", err))
@@ -56,10 +52,9 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	handler := &streamHandler{
-		conn:      conn,
-		engine:    s.Engine,
-		logger:    s.Logger,
-		batchSize: s.BatchSize,
+		conn:   conn,
+		engine: s.Engine,
+		logger: s.Logger,
 	}
 	handler.serve(r.Context())
 }
@@ -69,7 +64,6 @@ type streamHandler struct {
 	engine    Engine
 	logger    *slog.Logger
 	closeOnce sync.Once
-	batchSize int
 }
 
 func (h *streamHandler) serve(ctx context.Context) {
@@ -110,52 +104,32 @@ func (h *streamHandler) serve(ctx context.Context) {
 }
 
 func (h *streamHandler) streamBatches(ctx context.Context, schema *arrow.Schema, streamCh <-chan engine.StreamChunk) {
-	var pending []arrow.RecordBatch
-
-	sendBatch := func(batches []arrow.RecordBatch) error {
-		if len(batches) == 0 {
-			return nil
-		}
-
-		var buf bytes.Buffer
-		w := ipc.NewWriter(&buf, ipc.WithSchema(schema))
-
-		for _, batch := range batches {
-			if err := w.Write(batch); err != nil {
-				w.Close()
-				return err
-			}
-			batch.Release()
-		}
-
-		if err := w.Close(); err != nil {
-			return err
-		}
-
-		return h.conn.Write(ctx, websocket.MessageBinary, buf.Bytes())
+	wsWriter, err := h.conn.Writer(ctx, websocket.MessageBinary)
+	if err != nil {
+		h.handleWriteError(err)
+		return
 	}
+
+	ipcWriter := ipc.NewWriter(wsWriter, ipc.WithSchema(schema))
 
 	for {
 		select {
 		case <-ctx.Done():
-			for _, b := range pending {
-				b.Release()
-			}
+			ipcWriter.Close()
+			wsWriter.Close()
 			h.close(websocket.StatusNormalClosure, "cancelled")
 			return
 
 		case chunk, ok := <-streamCh:
 			if !ok {
-				if err := sendBatch(pending); err != nil {
-					h.handleWriteError(err)
-				}
+				ipcWriter.Close()
+				wsWriter.Close()
 				h.close(websocket.StatusNormalClosure, "done")
 				return
 			}
 			if chunk.Err != nil {
-				for _, b := range pending {
-					b.Release()
-				}
+				ipcWriter.Close()
+				wsWriter.Close()
 				h.logger.Error("stream error", slog.Any("err", chunk.Err))
 				h.close(websocket.StatusInternalError, "stream error")
 				return
@@ -164,15 +138,13 @@ func (h *streamHandler) streamBatches(ctx context.Context, schema *arrow.Schema,
 				continue
 			}
 
-			pending = append(pending, chunk.Data)
-
-			if len(pending) >= h.batchSize {
-				if err := sendBatch(pending); err != nil {
-					h.handleWriteError(err)
-					return
-				}
-				pending = nil
+			if err := ipcWriter.Write(chunk.Data); err != nil {
+				ipcWriter.Close()
+				wsWriter.Close()
+				h.close(websocket.StatusInternalError, "write error")
+				return
 			}
+			chunk.Data.Release()
 		}
 	}
 }

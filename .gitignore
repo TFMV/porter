@@ -18,6 +18,7 @@ linkedin.md
 bench/bench.parquet
 # Go workspace file
 go.work
+bench.db
 duckdb/
 clickhouse-go/
 arrow-go/
