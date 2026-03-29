@@ -53,51 +53,134 @@ func (r *Resolver) Resolve(d Driver, version string, p Platform) (*url.URL, erro
 }
 
 func (r *Resolver) DiscoverInstalled(cacheDir string, p Platform) ([]InstalledDriver, error) {
-	platformDir := filepath.Join(cacheDir)
-	driverEntries, err := os.ReadDir(platformDir)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil, nil
+	var all []InstalledDriver
+
+	dirsToSearch := []string{cacheDir}
+
+	if adbcDriversPath := os.Getenv("ADBC_DRIVER_PATH"); adbcDriversPath != "" {
+		for _, dir := range filepath.SplitList(adbcDriversPath) {
+			if dir != "" {
+				dirsToSearch = append(dirsToSearch, dir)
+			}
 		}
-		return nil, fmt.Errorf("read cache dir: %w", err)
 	}
 
-	var installed []InstalledDriver
-	tuple := p.Tuple()
-	for _, driverEntry := range driverEntries {
-		if !driverEntry.IsDir() {
+	adbcDriversDir, err := adbcDriversDir()
+	if err == nil {
+		dirsToSearch = append(dirsToSearch, adbcDriversDir)
+	}
+
+	for _, baseDir := range dirsToSearch {
+		drivers, err := r.discoverFromDir(baseDir, p)
+		if err != nil {
 			continue
 		}
-		driverName := driverEntry.Name()
-		versionsDir := filepath.Join(cacheDir, driverName)
-		versionEntries, err := os.ReadDir(versionsDir)
+		all = append(all, drivers...)
+	}
+
+	sort.Slice(all, func(i, j int) bool {
+		if all[i].Name != all[j].Name {
+			return all[i].Name < all[j].Name
+		}
+		if all[i].Version != all[j].Version {
+			return all[i].Version < all[j].Version
+		}
+		return all[i].LibPath < all[j].LibPath
+	})
+
+	return all, nil
+}
+
+func (r *Resolver) discoverFromDir(baseDir string, p Platform) ([]InstalledDriver, error) {
+	tuple := p.Tuple()
+	var installed []InstalledDriver
+
+	entries, err := os.ReadDir(baseDir)
+	if err != nil {
+		return nil, err
+	}
+
+	for _, entry := range entries {
+		driverName := entry.Name()
+
+		driverPath := filepath.Join(baseDir, driverName)
+		info, err := os.Stat(driverPath)
 		if err != nil {
 			continue
 		}
 
-		for _, versionEntry := range versionEntries {
-			if !versionEntry.IsDir() {
-				continue
-			}
-			version := versionEntry.Name()
-			driverDir := filepath.Join(versionsDir, version, tuple)
-			lib, err := findDriverLib(driverDir)
+		if info.Mode().IsDir() {
+			subEntries, err := os.ReadDir(driverPath)
 			if err != nil {
 				continue
 			}
-			installed = append(installed, InstalledDriver{Name: driverName, Version: version, LibPath: lib})
+
+			hasSubDirs := false
+			for _, se := range subEntries {
+				if se.IsDir() {
+					hasSubDirs = true
+					break
+				}
+			}
+
+			if hasSubDirs {
+				for _, versionEntry := range subEntries {
+					if !versionEntry.IsDir() {
+						continue
+					}
+					version := versionEntry.Name()
+					driverDir := filepath.Join(driverPath, version, tuple)
+					lib, err := findDriverLib(driverDir)
+					if err != nil {
+						altDir := filepath.Join(driverPath, version)
+						if lib, err := findDriverLib(altDir); err == nil {
+							installed = append(installed, InstalledDriver{Name: driverName, Version: version, LibPath: lib})
+							continue
+						}
+						continue
+					}
+					installed = append(installed, InstalledDriver{Name: driverName, Version: version, LibPath: lib})
+				}
+			} else {
+				lib, err := findDriverLib(driverPath)
+				if err != nil {
+					continue
+				}
+				driverName, version := extractNameAndVersion(driverName)
+				installed = append(installed, InstalledDriver{Name: driverName, Version: version, LibPath: lib})
+			}
+		} else {
+			lib, err := findDriverLib(driverPath)
+			if err != nil {
+				continue
+			}
+			installed = append(installed, InstalledDriver{Name: driverName, Version: "installed", LibPath: lib})
 		}
 	}
 
-	sort.Slice(installed, func(i, j int) bool {
-		if installed[i].Name != installed[j].Name {
-			return installed[i].Name < installed[j].Name
-		}
-		if installed[i].Version != installed[j].Version {
-			return installed[i].Version < installed[j].Version
-		}
-		return installed[i].LibPath < installed[j].LibPath
-	})
-
 	return installed, nil
+}
+
+func extractNameAndVersion(dirName string) (string, string) {
+	driverName := dirName
+	version := "unknown"
+
+	for i := len(dirName) - 1; i >= 0; i-- {
+		if dirName[i] == '_' || dirName[i] == '-' {
+			if i > 0 && (dirName[i-1] >= '0' && dirName[i-1] <= '9') {
+				version = dirName[i+1:]
+				driverName = dirName[:i]
+				break
+			}
+		}
+	}
+	return driverName, version
+}
+
+func adbcDriversDir() (string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(home, "Library", "Application Support", "ADBC", "Drivers"), nil
 }

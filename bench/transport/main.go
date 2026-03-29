@@ -193,6 +193,7 @@ func runWSQuery(ctx context.Context, cfg *runConfig) opMetric {
 	if err != nil {
 		return opMetric{errorOccurred: true}
 	}
+	conn.SetReadLimit(100 * 1024 * 1024)
 	defer conn.Close(websocket.StatusNormalClosure, "")
 
 	if err := wsjson.Write(ctx, conn, QueryRequest{Query: cfg.query}); err != nil {
@@ -231,7 +232,6 @@ func runWSQuery(ctx context.Context, cfg *runConfig) opMetric {
 		m.batches += int64(batches)
 		m.payloadBytes += int64(len(payload))
 		m.logicalBytes += logicalBytes
-		break
 	}
 
 	if !schemaRead {

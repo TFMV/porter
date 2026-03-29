@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 )
 
@@ -68,6 +69,18 @@ func (m *Manager) EnsureDriver(name string, version string) (string, error) {
 
 	if lib, err := findDriverLib(driverDir); err == nil {
 		return lib, nil
+	}
+
+	installed, err := m.Resolver.DiscoverInstalled(m.CacheDir, platform)
+	if err == nil && len(installed) > 0 {
+		for _, drv := range installed {
+			if strings.HasPrefix(drv.Name, name) {
+				return drv.LibPath, nil
+			}
+		}
+		if len(installed) > 0 {
+			return installed[0].LibPath, nil
+		}
 	}
 
 	lock := m.installLock(name, version, platform.Tuple())
