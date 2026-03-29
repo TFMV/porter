@@ -13,6 +13,7 @@ import (
 	flightsql "github.com/TFMV/porter/execution/adapter/flightsql"
 	ws "github.com/TFMV/porter/execution/adapter/ws"
 	"github.com/TFMV/porter/execution/engine"
+	"github.com/TFMV/porter/internal/adbc"
 	"github.com/apache/arrow-go/v18/arrow/flight"
 	"github.com/spf13/cobra"
 	"google.golang.org/grpc"
@@ -51,8 +52,14 @@ func init() {
 func runServe(cfg porterConfig) error {
 	cfg.DBPath = normalizeDBPath(cfg.DBPath)
 
+	adbcManager, err := adbc.NewManager()
+	if err != nil {
+		return fmt.Errorf("initialize adbc manager: %w", err)
+	}
+
 	eng, err := engine.New(engine.Config{
-		DBPath: cfg.DBPath,
+		DBPath:      cfg.DBPath,
+		ADBCManager: adbcManager,
 	})
 	if err != nil {
 		return fmt.Errorf("create engine: %w", err)
