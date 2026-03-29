@@ -4,24 +4,15 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
-	"sync"
 )
 
-const (
-	DefaultDriverName    = "duckdb"
-	DefaultDriverVersion = "latest"
-)
-
-type downloaderFunc func(downloadURL string, destDir string) (string, error)
+var requiredDrivers = []string{"duckdb", "flightsql"}
 
 type Manager struct {
 	CacheDir string
 	Resolver *Resolver
-
-	mu         sync.Mutex
-	installers map[string]*sync.Mutex
-	download   downloaderFunc
 }
 
 func NewManager() (*Manager, error) {
@@ -31,95 +22,72 @@ func NewManager() (*Manager, error) {
 	}
 
 	return &Manager{
-		CacheDir:   filepath.Join(dir, "porter", "adbc"),
-		Resolver:   DefaultResolver(),
-		installers: make(map[string]*sync.Mutex),
-		download:   DownloadAndExtract,
+		CacheDir: filepath.Join(dir, "porter", "adbc"),
+		Resolver: DefaultResolver(),
 	}, nil
 }
 
-func (m *Manager) EnsureDefaultDriver() (InstalledDriver, error) {
-	lib, err := m.EnsureDriver(DefaultDriverName, DefaultDriverVersion)
-	if err != nil {
-		return InstalledDriver{}, err
-	}
-	return InstalledDriver{Name: DefaultDriverName, Version: DefaultDriverVersion, LibPath: lib}, nil
-}
-
-func (m *Manager) DefaultInstalledDriver() (InstalledDriver, error) {
+func (m *Manager) EnsureRequiredDrivers() (map[string]InstalledDriver, error) {
 	installed, err := m.Resolver.DiscoverInstalled(m.CacheDir, CurrentPlatform())
 	if err != nil {
-		return InstalledDriver{}, err
-	}
-	if len(installed) == 0 {
-		return InstalledDriver{}, fmt.Errorf("no installed adbc drivers in %s", m.CacheDir)
-	}
-	return installed[0], nil
-}
-
-func (m *Manager) EnsureDriver(name string, version string) (string, error) {
-	platform := CurrentPlatform()
-
-	driverDir := filepath.Join(
-		m.CacheDir,
-		name,
-		version,
-		platform.Tuple(),
-	)
-
-	if lib, err := findDriverLib(driverDir); err == nil {
-		return lib, nil
+		return nil, fmt.Errorf("discover installed adbc drivers: %w", err)
 	}
 
-	installed, err := m.Resolver.DiscoverInstalled(m.CacheDir, platform)
-	if err == nil && len(installed) > 0 {
+	resolved := make(map[string]InstalledDriver, len(requiredDrivers))
+	for _, want := range requiredDrivers {
 		for _, drv := range installed {
-			if strings.HasPrefix(drv.Name, name) {
-				return drv.LibPath, nil
+			if driverNameMatches(drv.Name, want) {
+				resolved[want] = drv
+				break
 			}
 		}
-		if len(installed) > 0 {
-			return installed[0].LibPath, nil
+	}
+
+	var missing []string
+	for _, want := range requiredDrivers {
+		if _, ok := resolved[want]; !ok {
+			missing = append(missing, want)
 		}
 	}
-
-	lock := m.installLock(name, version, platform.Tuple())
-	lock.Lock()
-	defer lock.Unlock()
-
-	// Re-check after acquiring lock to keep installs idempotent and deterministic.
-	if lib, err := findDriverLib(driverDir); err == nil {
-		return lib, nil
+	if len(missing) > 0 {
+		return nil, MissingDriversError{Missing: missing}
 	}
 
-	driver := Driver{Name: name}
-
-	u, err := m.Resolver.Resolve(driver, version, platform)
-	if err != nil {
-		return "", fmt.Errorf("resolve driver %s@%s: %w", name, version, err)
-	}
-
-	path, err := m.download(u.String(), driverDir)
-	if err != nil {
-		return "", fmt.Errorf("install driver %s@%s: %w", name, version, err)
-	}
-
-	return path, nil
+	return resolved, nil
 }
 
-func (m *Manager) installLock(name, version, tuple string) *sync.Mutex {
-	key := name + "|" + version + "|" + tuple
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if m.installers == nil {
-		m.installers = make(map[string]*sync.Mutex)
+type MissingDriversError struct {
+	Missing []string
+}
+
+func (e MissingDriversError) Error() string {
+	missing := append([]string(nil), e.Missing...)
+	sort.Strings(missing)
+
+	var b strings.Builder
+	b.WriteString("Missing required ADBC drivers.\n\n")
+	b.WriteString("Porter requires the following drivers:\n")
+	for _, name := range missing {
+		b.WriteString("  - ")
+		b.WriteString(name)
+		b.WriteString("\n")
 	}
-	lock, ok := m.installers[key]
-	if !ok {
-		lock = &sync.Mutex{}
-		m.installers[key] = lock
+	b.WriteString("\nInstall them using dbc:\n\n")
+	b.WriteString("  curl -LsSf https://dbc.columnar.tech/install.sh | sh\n")
+	for _, name := range missing {
+		b.WriteString("  dbc install ")
+		b.WriteString(name)
+		b.WriteString("\n")
 	}
-	return lock
+
+	return strings.TrimRight(b.String(), "\n")
+}
+
+func driverNameMatches(found string, want string) bool {
+	found = strings.ToLower(found)
+	want = strings.ToLower(want)
+
+	return found == want || strings.Contains(found, want)
 }
 
 func findDriverLib(dir string) (string, error) {

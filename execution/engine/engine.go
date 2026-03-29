@@ -88,12 +88,13 @@ func New(cfg Config) (Engine, error) {
 		return nil, fmt.Errorf("adbc manager is required")
 	}
 
-	resolved, err := cfg.ADBCManager.EnsureDefaultDriver()
+	resolved, err := cfg.ADBCManager.EnsureRequiredDrivers()
 	if err != nil {
-		return nil, fmt.Errorf("ensure default adbc driver: %w", err)
+		return nil, err
 	}
-	logger.Info("resolved adbc driver via manager", slog.String("name", resolved.Name), slog.String("version", resolved.Version), slog.String("path", resolved.LibPath))
-	if err := os.Setenv("ADBC_DRIVER_PATH", resolved.LibPath); err != nil {
+	duckdb := resolved["duckdb"]
+	logger.Info("resolved required adbc drivers", slog.String("duckdbPath", duckdb.LibPath), slog.String("flightsqlPath", resolved["flightsql"].LibPath))
+	if err := os.Setenv("ADBC_DRIVER_PATH", duckdb.LibPath); err != nil {
 		return nil, fmt.Errorf("set ADBC_DRIVER_PATH: %w", err)
 	}
 

@@ -35,16 +35,16 @@ func normalizeDBPath(path string) string {
 	return path
 }
 
-func ensureADBCDefaultDriver() error {
+func ensureRequiredADBCDrivers() error {
 	manager, err := internaladbc.NewManager()
 	if err != nil {
 		return fmt.Errorf("initialize adbc manager: %w", err)
 	}
-	resolved, err := manager.EnsureDefaultDriver()
+	resolved, err := manager.EnsureRequiredDrivers()
 	if err != nil {
-		return fmt.Errorf("ensure default adbc driver: %w", err)
+		return err
 	}
-	if err := os.Setenv("ADBC_DRIVER_PATH", resolved.LibPath); err != nil {
+	if err := os.Setenv("ADBC_DRIVER_PATH", resolved["duckdb"].LibPath); err != nil {
 		return fmt.Errorf("set ADBC_DRIVER_PATH: %w", err)
 	}
 	return nil
@@ -53,7 +53,7 @@ func ensureADBCDefaultDriver() error {
 func openDuckDBConnection(ctx context.Context, dbPath string) (apacheadbc.Database, apacheadbc.Connection, error) {
 	dbPath = normalizeDBPath(dbPath)
 
-	if err := ensureADBCDefaultDriver(); err != nil {
+	if err := ensureRequiredADBCDrivers(); err != nil {
 		return nil, nil, err
 	}
 
