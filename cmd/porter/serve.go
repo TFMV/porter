@@ -14,16 +14,19 @@ import (
 	ws "github.com/TFMV/porter/execution/adapter/ws"
 	"github.com/TFMV/porter/execution/engine"
 	"github.com/TFMV/porter/internal/adbc"
+	"github.com/TFMV/porter/telemetry"
 	"github.com/apache/arrow-go/v18/arrow/flight"
 	"github.com/spf13/cobra"
 	"google.golang.org/grpc"
 )
 
 var (
-	dbPath   string
-	port     int
-	wsEnable bool
-	wsPort   int
+	dbPath       string
+	port         int
+	wsEnable     bool
+	wsPort       int
+	statusEnable bool
+	statusPort   int
 )
 
 var serveCmd = &cobra.Command{
@@ -33,10 +36,12 @@ var serveCmd = &cobra.Command{
 	Args:  cobra.NoArgs,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		cfg := porterConfig{
-			DBPath:   dbPath,
-			Port:     port,
-			WsEnable: wsEnable,
-			WsPort:   wsPort,
+			DBPath:       dbPath,
+			Port:         port,
+			WsEnable:     wsEnable,
+			WsPort:       wsPort,
+			StatusEnable: statusEnable,
+			StatusPort:   statusPort,
 		}
 		return runServe(cfg)
 	},
@@ -47,10 +52,14 @@ func init() {
 	serveCmd.Flags().IntVar(&port, "port", 32010, "Port to run FlightSQL server on")
 	serveCmd.Flags().BoolVar(&wsEnable, "ws", false, "Enable WebSocket endpoint")
 	serveCmd.Flags().IntVar(&wsPort, "ws-port", 8080, "Port to run WebSocket server on")
+	serveCmd.Flags().BoolVar(&statusEnable, "status", true, "Enable status endpoint")
+	serveCmd.Flags().IntVar(&statusPort, "status-port", 9091, "Port to run status server on")
 }
 
 func runServe(cfg porterConfig) error {
 	cfg.DBPath = normalizeDBPath(cfg.DBPath)
+	statusAggregator := telemetry.NewAggregator(telemetry.Config{})
+	defer statusAggregator.Close()
 
 	adbcManager, err := adbc.NewManager()
 	if err != nil {
@@ -60,6 +69,7 @@ func runServe(cfg porterConfig) error {
 	eng, err := engine.New(engine.Config{
 		DBPath:      cfg.DBPath,
 		ADBCManager: adbcManager,
+		Telemetry:   statusAggregator,
 	})
 	if err != nil {
 		return fmt.Errorf("create engine: %w", err)
@@ -75,7 +85,8 @@ func runServe(cfg porterConfig) error {
 	}
 
 	srv, err := flightsql.NewServer(flightsql.Config{
-		Engine: eng,
+		Engine:    eng,
+		Telemetry: statusAggregator,
 	})
 	if err != nil {
 		return fmt.Errorf("initialize FlightSQL server: %w", err)
@@ -90,7 +101,7 @@ func runServe(cfg porterConfig) error {
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
 
-	errCh := make(chan error, 2)
+	errCh := make(chan error, 4)
 
 	// Start FlightSQL server
 	go func() {
@@ -101,19 +112,38 @@ func runServe(cfg porterConfig) error {
 	if cfg.WsEnable {
 		wsAddr := fmt.Sprintf(":%d", cfg.WsPort)
 		logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
-		wsServer := ws.NewServer(eng, logger)
+		wsServer := ws.NewServer(eng, logger, statusAggregator)
 		go func() {
 			log.Printf("starting Porter WebSocket on %s", wsAddr)
 			errCh <- http.ListenAndServe(wsAddr, wsServer)
 		}()
 	}
 
+	var statusHTTP *http.Server
+	if cfg.StatusEnable {
+		statusAddr := fmt.Sprintf(":%d", cfg.StatusPort)
+		statusHTTP = &http.Server{
+			Addr:    statusAddr,
+			Handler: telemetry.NewServer(statusAggregator),
+		}
+		go func() {
+			log.Printf("starting Porter status server on %s", statusAddr)
+			errCh <- statusHTTP.ListenAndServe()
+		}()
+	}
+
 	select {
 	case err := <-errCh:
+		if err == http.ErrServerClosed {
+			return nil
+		}
 		return fmt.Errorf("server error: %w", err)
 	case sig := <-stop:
 		log.Printf("received %s, shutting down", sig)
 		grpcSrv.GracefulStop()
+		if statusHTTP != nil {
+			_ = statusHTTP.Close()
+		}
 		return nil
 	}
 }

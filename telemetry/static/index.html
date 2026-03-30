@@ -1,0 +1,752 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Porter Status</title>
+    <style>
+      :root {
+        --bg: #07111f;
+        --bg-alt: #0d1a2d;
+        --panel: rgba(9, 23, 42, 0.86);
+        --panel-strong: rgba(12, 31, 56, 0.95);
+        --line: rgba(138, 180, 248, 0.16);
+        --text: #eef4ff;
+        --muted: #93a7c8;
+        --healthy: #42d392;
+        --warning: #ffbf47;
+        --degraded: #ff6b57;
+        --accent: #5bc0eb;
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        margin: 0;
+        min-height: 100vh;
+        font-family: "Avenir Next", "Segoe UI", sans-serif;
+        color: var(--text);
+        background:
+          radial-gradient(circle at top left, rgba(91, 192, 235, 0.18), transparent 38%),
+          radial-gradient(circle at 85% 15%, rgba(66, 211, 146, 0.16), transparent 28%),
+          linear-gradient(160deg, var(--bg) 0%, #020814 100%);
+      }
+
+      .shell {
+        width: min(1400px, calc(100vw - 32px));
+        margin: 24px auto 48px;
+        display: grid;
+        gap: 18px;
+      }
+
+      .hero,
+      .panel {
+        border: 1px solid var(--line);
+        background: linear-gradient(180deg, rgba(16, 34, 58, 0.94), var(--panel));
+        border-radius: 24px;
+        backdrop-filter: blur(12px);
+        box-shadow: 0 22px 70px rgba(0, 0, 0, 0.24);
+      }
+
+      .hero {
+        padding: 24px 24px 18px;
+      }
+
+      .hero h1 {
+        margin: 0 0 8px;
+        font-size: clamp(30px, 4vw, 52px);
+        line-height: 0.94;
+        letter-spacing: -0.04em;
+      }
+
+      .hero p {
+        margin: 0;
+        max-width: 780px;
+        color: var(--muted);
+        font-size: 15px;
+      }
+
+      .hero-top {
+        display: flex;
+        justify-content: space-between;
+        align-items: flex-start;
+        gap: 16px;
+      }
+
+      .health-pill {
+        padding: 12px 14px;
+        min-width: 200px;
+        border-radius: 18px;
+        background: rgba(255, 255, 255, 0.04);
+        border: 1px solid rgba(255, 255, 255, 0.08);
+      }
+
+      .health-pill strong {
+        display: block;
+        font-size: 12px;
+        text-transform: uppercase;
+        letter-spacing: 0.14em;
+        color: var(--muted);
+      }
+
+      .health-pill span {
+        display: block;
+        margin-top: 6px;
+        font-size: 20px;
+      }
+
+      .hero-meta {
+        display: flex;
+        gap: 16px;
+        margin-top: 18px;
+        color: var(--muted);
+        font-size: 13px;
+        flex-wrap: wrap;
+        align-items: center;
+      }
+
+      .refresh-links {
+        display: flex;
+        gap: 8px;
+        align-items: center;
+      }
+
+      .refresh-links a {
+        color: var(--muted);
+        text-decoration: none;
+        padding: 2px 6px;
+        border-radius: 4px;
+        font-size: 12px;
+        transition: color 0.2s;
+      }
+
+      .refresh-links a:hover {
+        color: var(--text);
+      }
+
+      .refresh-links a.active {
+        color: var(--accent);
+        background: rgba(91, 192, 235, 0.15);
+      }
+
+      .pipeline {
+        padding: 22px;
+      }
+
+      .pipeline-grid {
+        display: grid;
+        gap: 12px;
+        grid-template-columns: repeat(7, minmax(0, 1fr));
+        align-items: center;
+      }
+
+      .node,
+      .edge {
+        position: relative;
+        overflow: hidden;
+      }
+
+      .node {
+        padding: 18px 16px;
+        background: linear-gradient(180deg, rgba(18, 39, 67, 0.98), rgba(10, 24, 43, 0.96));
+        border-radius: 22px;
+        border: 1px solid rgba(255, 255, 255, 0.08);
+        min-height: 190px;
+        animation: rise 450ms ease both;
+      }
+
+      .node::before,
+      .edge::before {
+        content: "";
+        position: absolute;
+        inset: 0;
+        opacity: 0.75;
+        pointer-events: none;
+      }
+
+      .healthy::before {
+        background: linear-gradient(180deg, rgba(66, 211, 146, 0.16), transparent 65%);
+      }
+
+      .warning::before {
+        background: linear-gradient(180deg, rgba(255, 191, 71, 0.18), transparent 65%);
+      }
+
+      .degraded::before {
+        background: linear-gradient(180deg, rgba(255, 107, 87, 0.2), transparent 65%);
+      }
+
+      .node-header {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        margin-bottom: 18px;
+      }
+
+      .node-title {
+        font-size: 18px;
+        letter-spacing: -0.02em;
+      }
+
+      .status-dot {
+        width: 12px;
+        height: 12px;
+        border-radius: 999px;
+        box-shadow: 0 0 18px currentColor;
+      }
+
+      .healthy .status-dot { color: var(--healthy); background: var(--healthy); }
+      .warning .status-dot { color: var(--warning); background: var(--warning); }
+      .degraded .status-dot { color: var(--degraded); background: var(--degraded); }
+
+      .metric {
+        display: flex;
+        justify-content: space-between;
+        gap: 10px;
+        margin-bottom: 10px;
+        color: var(--muted);
+        font-size: 13px;
+      }
+
+      .metric strong {
+        color: var(--text);
+        font-weight: 600;
+      }
+
+      .edge {
+        min-height: 140px;
+        border-radius: 999px;
+        border: 1px solid rgba(255, 255, 255, 0.06);
+        background:
+          linear-gradient(90deg, rgba(91, 192, 235, 0.08), rgba(91, 192, 235, 0.25), rgba(91, 192, 235, 0.08));
+        display: grid;
+        place-items: center;
+        padding: 14px;
+        animation: pulse 2.4s ease-in-out infinite;
+      }
+
+      .edge-body {
+        text-align: center;
+      }
+
+      .edge-body strong {
+        display: block;
+        font-size: 15px;
+      }
+
+      .edge-body span {
+        display: block;
+        color: var(--muted);
+        font-size: 12px;
+        margin-top: 3px;
+      }
+
+      .grid-two {
+        display: grid;
+        grid-template-columns: minmax(0, 1.1fr) minmax(0, 0.9fr);
+        gap: 18px;
+      }
+
+      .panel {
+        padding: 20px;
+      }
+
+      .panel h2 {
+        margin: 0 0 16px;
+        font-size: 18px;
+        letter-spacing: -0.02em;
+      }
+
+      .panel-top {
+        display: flex;
+        justify-content: space-between;
+        gap: 16px;
+        align-items: baseline;
+      }
+
+      .subtle {
+        color: var(--muted);
+        font-size: 13px;
+      }
+
+      .chart-grid {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 14px;
+      }
+
+      .chart-card {
+        padding: 14px;
+        border-radius: 18px;
+        background: rgba(255, 255, 255, 0.03);
+        border: 1px solid rgba(255, 255, 255, 0.06);
+      }
+
+      .chart-card h3 {
+        margin: 0 0 10px;
+        font-size: 15px;
+      }
+
+      svg {
+        width: 100%;
+        height: 110px;
+        display: block;
+      }
+
+      .sparkline path {
+        fill: none;
+        stroke-width: 2.5;
+      }
+
+      .legend {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 10px 14px;
+        margin-top: 12px;
+        color: var(--muted);
+        font-size: 12px;
+      }
+
+      .legend span::before {
+        content: "";
+        display: inline-block;
+        width: 10px;
+        height: 10px;
+        border-radius: 999px;
+        margin-right: 6px;
+        vertical-align: middle;
+      }
+
+      .legend .p50::before { background: #5bc0eb; }
+      .legend .p95::before { background: #ffbf47; }
+      .legend .p99::before { background: #ff6b57; }
+
+      table {
+        width: 100%;
+        border-collapse: collapse;
+      }
+
+      th, td {
+        padding: 12px 10px;
+        text-align: left;
+        border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+      }
+
+      th {
+        color: var(--muted);
+        font-size: 12px;
+        text-transform: uppercase;
+        letter-spacing: 0.14em;
+      }
+
+      td strong {
+        font-size: 14px;
+      }
+
+      .feed {
+        display: grid;
+        gap: 10px;
+        max-height: 420px;
+        overflow: auto;
+        padding-right: 4px;
+      }
+
+      .feed-item {
+        display: grid;
+        grid-template-columns: auto 1fr;
+        gap: 12px;
+        padding: 12px 14px;
+        border-radius: 16px;
+        background: rgba(255, 255, 255, 0.03);
+        border: 1px solid rgba(255, 255, 255, 0.06);
+      }
+
+      .feed-time {
+        font-family: "SFMono-Regular", "IBM Plex Mono", monospace;
+        color: var(--muted);
+        font-size: 12px;
+      }
+
+      .feed-message {
+        font-size: 14px;
+      }
+
+      @keyframes pulse {
+        0%, 100% { transform: scaleX(1); opacity: 0.88; }
+        50% { transform: scaleX(1.02); opacity: 1; }
+      }
+
+      @keyframes rise {
+        from { transform: translateY(8px); opacity: 0; }
+        to { transform: translateY(0); opacity: 1; }
+      }
+
+      @media (max-width: 1100px) {
+        .pipeline-grid {
+          grid-template-columns: repeat(4, minmax(0, 1fr));
+        }
+
+        .edge {
+          min-height: 96px;
+        }
+
+        .grid-two {
+          grid-template-columns: 1fr;
+        }
+      }
+
+      @media (max-width: 760px) {
+        .shell {
+          width: min(100vw - 18px, 100%);
+          margin: 10px auto 28px;
+        }
+
+        .hero,
+        .panel,
+        .pipeline {
+          border-radius: 20px;
+          padding: 16px;
+        }
+
+        .pipeline-grid {
+          grid-template-columns: 1fr;
+        }
+
+        .chart-grid {
+          grid-template-columns: 1fr;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <main class="shell">
+      <section class="hero">
+        <div class="hero-top">
+          <div>
+            <h1>Porter Pressure Cross-Section</h1>
+          </div>
+          <div class="health-pill" id="health-pill">
+            <strong>System Health</strong>
+            <span id="health-status">healthy</span>
+          </div>
+        </div>
+        <div class="hero-meta">
+          <span id="last-updated">Waiting for live telemetry...</span>
+          <span id="drop-count">Dropped events: 0</span>
+          <span class="refresh-links">
+            Refresh: 
+            <a href="#" data-rate="500">0.5s</a>
+            <a href="#" data-rate="1000" class="active">1s</a>
+            <a href="#" data-rate="2000">2s</a>
+            <a href="#" data-rate="5000">5s</a>
+          </span>
+        </div>
+      </section>
+
+      <section class="pipeline panel">
+        <div class="panel-top">
+          <h2>Flow View</h2>
+          <span class="subtle">Live 1s window for flow, pressure, and latency by stage</span>
+        </div>
+        <div class="pipeline-grid" id="pipeline-grid"></div>
+      </section>
+
+      <section class="grid-two">
+        <section class="panel">
+          <div class="panel-top">
+            <h2>Pressure & Latency</h2>
+            <span class="subtle">Last minute, refreshed every second</span>
+          </div>
+          <div class="chart-grid" id="charts"></div>
+        </section>
+
+        <section class="panel">
+          <div class="panel-top">
+            <h2>Path Comparison</h2>
+            <span class="subtle">Terminal path performance over the last minute</span>
+          </div>
+          <table>
+            <thead>
+              <tr>
+                <th>Path</th>
+                <th>Rows/sec</th>
+                <th>MB/s</th>
+                <th>p50</th>
+                <th>p99</th>
+              </tr>
+            </thead>
+            <tbody id="paths-body"></tbody>
+          </table>
+        </section>
+      </section>
+
+      <section class="panel">
+        <div class="panel-top">
+          <h2>Live Activity Feed</h2>
+          <span class="subtle">Structured narrative from the event stream</span>
+        </div>
+        <div class="feed" id="feed"></div>
+      </section>
+    </main>
+
+    <script>
+      const state = {
+        history: [],
+        latest: null,
+      };
+
+      const pipelineOrder = ["ingress", "transport", "execution", "egress"];
+
+      function statusClass(status) {
+        return status || "healthy";
+      }
+
+      function formatRate(value) {
+        return Intl.NumberFormat("en-US", { maximumFractionDigits: 0 }).format(value || 0);
+      }
+
+      function formatMB(value) {
+        return (value || 0).toFixed(1);
+      }
+
+      function formatPct(value) {
+        return ((value || 0) * 100).toFixed(1) + "%";
+      }
+
+      function formatLatency(value) {
+        return (value || 0).toFixed(1) + " ms";
+      }
+
+      function formatQueue(queue) {
+        if (!queue) {
+          return "0";
+        }
+        if (queue.unit === "bytes") {
+          const current = (queue.current || 0) / (1024 * 1024);
+          const capacity = (queue.capacity || 0) / (1024 * 1024);
+          if (queue.capacity) {
+            return `${current.toFixed(1)}MB/${capacity.toFixed(1)}MB`;
+          }
+          return `${current.toFixed(1)}MB`;
+        }
+        if (!queue || !queue.capacity) {
+          return String(queue?.current || 0);
+        }
+        return `${queue.current}/${queue.capacity}`;
+      }
+
+      function clock(value) {
+        if (!value) return "--";
+        return new Date(value).toLocaleTimeString();
+      }
+
+      function renderPipeline(snapshot) {
+        const grid = document.getElementById("pipeline-grid");
+        const componentMap = new Map(snapshot.components.map((item) => [item.name, item]));
+        const edgeMap = new Map(snapshot.edges.map((item) => [`${item.from}-${item.to}`, item]));
+        const parts = [];
+
+        pipelineOrder.forEach((name, index) => {
+          const component = componentMap.get(name) || {
+            name,
+            status: "healthy",
+            pressure: "stable",
+            rows_per_second: 0,
+            bytes_per_second: 0,
+            error_rate: 0,
+            latency: {},
+            queue: {},
+          };
+
+          parts.push(`
+            <article class="node ${statusClass(component.status)}">
+              <div class="node-header">
+                <div class="node-title">${name}</div>
+                <span class="status-dot"></span>
+              </div>
+              <div class="metric"><span>Rows/sec</span><strong>${formatRate(component.rows_per_second)}</strong></div>
+              <div class="metric"><span>MB/sec</span><strong>${formatMB((component.bytes_per_second || 0) / (1024 * 1024))}</strong></div>
+              <div class="metric"><span>Queue depth</span><strong>${formatQueue(component.queue)}</strong></div>
+              <div class="metric"><span>Error rate</span><strong>${formatPct(component.error_rate)}</strong></div>
+              <div class="metric"><span>p99 latency</span><strong>${formatLatency(component.latency?.p99_ms)}</strong></div>
+            </article>
+          `);
+
+          if (index < pipelineOrder.length - 1) {
+            const next = pipelineOrder[index + 1];
+            const edge = edgeMap.get(`${name}-${next}`) || {
+              throughput_mbps: 0,
+              pressure: "balanced",
+              imbalance: 0,
+              status: "healthy",
+            };
+            parts.push(`
+              <div class="edge ${statusClass(edge.status)}">
+                <div class="edge-body">
+                  <strong>${formatMB(edge.throughput_mbps)} MB/s</strong>
+                  <span>${edge.pressure} pressure</span>
+                  <span>${formatPct(edge.imbalance)} mismatch</span>
+                </div>
+              </div>
+            `);
+          }
+        });
+
+        grid.innerHTML = parts.join("");
+      }
+
+      function seriesFor(componentName, selector) {
+        return state.history.map((snapshot) => {
+          const component = snapshot.components.find((item) => item.name === componentName);
+          return selector(component || {});
+        });
+      }
+
+      function buildLine(values, color, height = 110) {
+        const width = 300;
+        const max = Math.max(...values, 1);
+        const points = values.map((value, index) => {
+          const x = values.length === 1 ? width : (index / Math.max(values.length - 1, 1)) * width;
+          const y = height - (value / max) * (height - 10) - 5;
+          return `${x.toFixed(2)},${y.toFixed(2)}`;
+        }).join(" ");
+        return `<path d="M ${points.replace(/ /g, " L ")}" stroke="${color}"></path>`;
+      }
+
+      function renderCharts() {
+        const charts = document.getElementById("charts");
+        const queueValues = seriesFor("transport", (component) => component.queue?.current || 0);
+        const p50 = seriesFor("execution", (component) => component.latency?.p50_ms || 0);
+        const p95 = seriesFor("execution", (component) => component.latency?.p95_ms || 0);
+        const p99 = seriesFor("execution", (component) => component.latency?.p99_ms || 0);
+        const ingress = seriesFor("ingress", (component) => component.rows_per_second || 0);
+        const execution = seriesFor("execution", (component) => component.rows_per_second || 0);
+
+        charts.innerHTML = `
+          <article class="chart-card">
+            <h3>Transport Queue Depth</h3>
+            <svg class="sparkline" viewBox="0 0 300 110" preserveAspectRatio="none">
+              ${buildLine(queueValues, "#ffbf47")}
+            </svg>
+          </article>
+          <article class="chart-card">
+            <h3>Execution Latency</h3>
+            <svg class="sparkline" viewBox="0 0 300 110" preserveAspectRatio="none">
+              ${buildLine(p50, "#5bc0eb")}
+              ${buildLine(p95, "#ffbf47")}
+              ${buildLine(p99, "#ff6b57")}
+            </svg>
+            <div class="legend">
+              <span class="p50">p50</span>
+              <span class="p95">p95</span>
+              <span class="p99">p99</span>
+            </div>
+          </article>
+          <article class="chart-card">
+            <h3>Ingress vs Execution</h3>
+            <svg class="sparkline" viewBox="0 0 300 110" preserveAspectRatio="none">
+              ${buildLine(ingress, "#42d392")}
+              ${buildLine(execution, "#5bc0eb")}
+            </svg>
+          </article>
+          <article class="chart-card">
+            <h3>Live Health Reasons</h3>
+            <div class="subtle">${(state.latest?.health?.reasons || []).join("<br>") || "No active degradations"}</div>
+          </article>
+        `;
+      }
+
+      function renderPaths(snapshot) {
+        document.getElementById("paths-body").innerHTML = snapshot.paths.map((path) => `
+          <tr>
+            <td><strong>${path.name}</strong></td>
+            <td>${formatRate(path.rows_per_second)}</td>
+            <td>${formatMB(path.mb_per_second)}</td>
+            <td>${formatLatency(path.latency?.p50_ms)}</td>
+            <td>${formatLatency(path.latency?.p99_ms)}</td>
+          </tr>
+        `).join("");
+      }
+
+      function renderFeed(snapshot) {
+        document.getElementById("feed").innerHTML = (snapshot.feed || []).slice().reverse().map((item) => `
+          <article class="feed-item">
+            <div class="feed-time">${clock(item.time)}</div>
+            <div class="feed-message">${item.message}</div>
+          </article>
+        `).join("");
+      }
+
+      function renderMeta(snapshot) {
+        document.getElementById("health-status").textContent = snapshot.health?.status || "unknown";
+        document.getElementById("last-updated").textContent = `Updated ${clock(snapshot.time)}`;
+        document.getElementById("drop-count").textContent = `Dropped events: ${snapshot.dropped_events || 0}`;
+        document.getElementById("health-pill").className = `health-pill ${statusClass(snapshot.health?.status)}`;
+      }
+
+      function render(snapshot) {
+        state.latest = snapshot;
+        renderMeta(snapshot);
+        renderPipeline(snapshot);
+        renderPaths(snapshot);
+        renderFeed(snapshot);
+        renderCharts();
+      }
+
+      async function bootstrap() {
+        const [liveRes, historyRes] = await Promise.all([
+          fetch("/status/live"),
+          fetch("/status/history"),
+        ]);
+        const live = await liveRes.json();
+        const history = await historyRes.json();
+        state.history = history.snapshots || [];
+        render(live);
+
+        let rate = 1000;
+        let lastRender = 0;
+        let pendingSnapshot = null;
+
+        document.querySelectorAll(".refresh-links a").forEach((link) => {
+          link.addEventListener("click", (e) => {
+            e.preventDefault();
+            document.querySelectorAll(".refresh-links a").forEach((l) => l.classList.remove("active"));
+            link.classList.add("active");
+            rate = parseInt(link.dataset.rate);
+            lastRender = Date.now();
+            if (pendingSnapshot) {
+              render(pendingSnapshot);
+              pendingSnapshot = null;
+            }
+          });
+        });
+
+        const source = new EventSource("/status/stream");
+        source.addEventListener("snapshot", (event) => {
+          const snapshot = JSON.parse(event.data);
+          state.history.push({ ...snapshot, feed: [] });
+          if (state.history.length > 180) {
+            state.history = state.history.slice(-180);
+          }
+          pendingSnapshot = snapshot;
+
+          const now = Date.now();
+          if (now - lastRender >= rate) {
+            lastRender = now;
+            if (pendingSnapshot) {
+              render(pendingSnapshot);
+              pendingSnapshot = null;
+            }
+          }
+        });
+      }
+
+      bootstrap().catch((error) => {
+        document.getElementById("last-updated").textContent = "Failed to load status surface";
+        document.getElementById("feed").innerHTML = `<article class="feed-item"><div class="feed-time">now</div><div class="feed-message">${error.message}</div></article>`;
+      });
+    </script>
+  </body>
+</html>

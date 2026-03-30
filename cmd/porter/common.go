@@ -13,18 +13,22 @@ import (
 )
 
 type porterConfig struct {
-	DBPath   string
-	Port     int
-	WsEnable bool
-	WsPort   int
+	DBPath       string
+	Port         int
+	WsEnable     bool
+	WsPort       int
+	StatusEnable bool
+	StatusPort   int
 }
 
 func loadConfig() porterConfig {
 	return porterConfig{
-		DBPath:   viper.GetString("db"),
-		Port:     viper.GetInt("port"),
-		WsEnable: viper.GetBool("ws"),
-		WsPort:   viper.GetInt("ws-port"),
+		DBPath:       viper.GetString("db"),
+		Port:         viper.GetInt("port"),
+		WsEnable:     viper.GetBool("ws"),
+		WsPort:       viper.GetInt("ws-port"),
+		StatusEnable: viper.GetBool("status"),
+		StatusPort:   viper.GetInt("status-port"),
 	}
 }
 
