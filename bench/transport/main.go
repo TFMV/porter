@@ -347,7 +347,6 @@ func runFlightIngest(ctx context.Context, cfg *runConfig) opMetric {
 	})
 
 	if err != nil {
-		fmt.Printf("FlightSQL ingest error: %v\n", err)
 		return opMetric{errorOccurred: true}
 	}
 
@@ -366,6 +365,11 @@ func runFlightIngest(ctx context.Context, cfg *runConfig) opMetric {
 // =========================
 
 func buildIngestReader() (array.RecordReader, int, error) {
+	const (
+		batchSize  int64 = 32768
+		numBatches int   = 32
+	)
+
 	fields := []arrow.Field{
 		{Name: "id", Type: arrow.PrimitiveTypes.Int64},
 		{Name: "payload", Type: arrow.BinaryTypes.String},
@@ -373,16 +377,16 @@ func buildIngestReader() (array.RecordReader, int, error) {
 
 	schema := arrow.NewSchema(fields, nil)
 
-	makeBatch := func(start, size int64) arrow.RecordBatch {
+	makeBatch := func(start int64) arrow.RecordBatch {
 		b := array.NewRecordBuilder(memory.NewGoAllocator(), schema)
 		defer b.Release()
 
-		ids := make([]int64, size)
-		vals := make([]string, size)
+		ids := make([]int64, batchSize)
+		vals := make([]string, batchSize)
 
-		for i := int64(0); i < size; i++ {
+		for i := int64(0); i < batchSize; i++ {
 			ids[i] = start + i
-			vals[i] = "v"
+			vals[i] = "payload_data"
 		}
 
 		b.Field(0).(*array.Int64Builder).AppendValues(ids, nil)
@@ -391,20 +395,25 @@ func buildIngestReader() (array.RecordReader, int, error) {
 		return b.NewRecordBatch()
 	}
 
-	b1 := makeBatch(0, 5000)
-	b2 := makeBatch(5000, 5000)
-	b3 := makeBatch(10000, 5000)
+	batches := make([]arrow.RecordBatch, numBatches)
+	for i := 0; i < numBatches; i++ {
+		batches[i] = makeBatch(int64(i) * batchSize)
+	}
 
-	reader, err := array.NewRecordReader(schema, []arrow.RecordBatch{b1, b2, b3})
+	reader, err := array.NewRecordReader(schema, batches)
 	if err != nil {
 		return nil, 0, err
 	}
 
-	return reader, 3, nil
+	return reader, numBatches, nil
 }
 
 func estimateReaderBytes() int64 {
-	return 5000 * 3 * 16
+	const (
+		batchSize  int64 = 32768
+		numBatches int   = 32
+	)
+	return batchSize * int64(numBatches) * 16
 }
 
 // =========================
