@@ -40,6 +40,7 @@ See the [Benchmark Report](bench/bench_results.md) for details.
 
 * Streaming-first execution model (Arrow RecordBatch streams)
 * Dual transport support: Flight SQL + WebSocket
+* **Bulk Ingest** — Arrow RecordBatch → DuckDB with transactional semantics
 * Shared execution engine for semantic parity
 * Native DuckDB execution via ADBC
 * Full prepared statement lifecycle with parameter binding
@@ -238,6 +239,45 @@ Receive:
 
 ---
 
+## 📥 Bulk Ingest
+
+Porter supports high-throughput Arrow RecordBatch ingestion via Flight SQL's DoPut:
+
+```go
+// Engine interface
+IngestStream(ctx, table, reader, opts) (int64, error)
+```
+
+**Features:**
+
+| Feature | Description |
+|---------|-------------|
+| Transactional | One stream = one DB transaction |
+| Schema validation | Incoming Arrow schema must match target table |
+| Backpressure | Configurable `MaxUncommittedBytes` (default 64MB) |
+| Table locking | Per-table mutex prevents concurrent writes to same table |
+| Auto-commit | Automatically commits on successful ingest, rolls back on failure |
+
+**IngestOptions:**
+
+| Option | Description |
+|--------|-------------|
+| `Catalog` | Target catalog name |
+| `DBSchema` | Target schema name |
+| `Temporary` | Create as temporary table |
+| `IngestMode` | Append, replace, or create |
+| `MaxUncommittedBytes` | Memory limit before fail-fast (default 64MB) |
+
+**Flow:**
+
+```
+Client → DoPut (Arrow RecordBatch stream) → Engine.IngestStream → SegmentWriter → Commit → DuckDB
+```
+
+The SegmentWriter accumulates RecordBatches in memory, then atomically publishes them on commit. If `MaxUncommittedBytes` is exceeded, ingestion fails fast with rollback.
+
+---
+
 ## 🌊 Streaming Core
 
 Both transports use the same execution primitive:
@@ -259,6 +299,7 @@ Backpressure is enforced naturally via the channel boundary.
 - [x] Streaming Flight SQL execution
 - [x] WebSocket transport
 - [x] Shared execution engine
+- [x] Bulk Ingest (DoPut)
 - [x] Prepared statements
 - [x] TTL-based lifecycle
 - [x] Background GC
