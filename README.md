@@ -172,6 +172,7 @@ porter --ws                        # Flight SQL + WebSocket
 porter serve --ws                   # Same as above
 porter serve --ws --ws-port 9090   # Custom WebSocket port
 porter serve --status-port 9191    # Custom status surface
+porter serve --ducklake --ducklake-path ./metadata.ducklake
 ```
 
 ### Full Flags
@@ -184,6 +185,8 @@ porter serve --status-port 9191    # Custom status surface
 | `--ws-port` | WebSocket port | `8080` |
 | `--status` | Enable live status surface | `true` |
 | `--status-port` | Status server port | `9091` |
+| `--ducklake` | Enable DuckLake during server startup | `false` |
+| `--ducklake-path` | DuckLake metadata path | `metadata.ducklake` |
 
 ### Execute a query
 
@@ -217,6 +220,30 @@ porter schema table_name
 * `PORTER_WS_PORT`
 * `PORTER_STATUS`
 * `PORTER_STATUS_PORT`
+* `PORTER_DUCKLAKE`
+* `PORTER_DUCKLAKE_PATH`
+
+### DuckLake Startup
+
+When `--ducklake` is enabled, Porter initializes DuckLake during server startup and keeps the existing FlightSQL/Arrow execution path unchanged.
+
+Startup initialization:
+
+```sql
+INSTALL ducklake;
+LOAD ducklake;
+ATTACH 'ducklake:<path>' AS my_ducklake;
+USE my_ducklake;
+```
+
+Per-connection initialization:
+
+```sql
+LOAD ducklake;
+USE my_ducklake;
+```
+
+That keeps DuckLake as a database configuration concern instead of introducing any alternate query or transport flow.
 
 ---
 

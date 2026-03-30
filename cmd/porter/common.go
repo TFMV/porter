@@ -19,6 +19,8 @@ type porterConfig struct {
 	WsPort       int
 	StatusEnable bool
 	StatusPort   int
+	DuckLake     bool
+	DuckLakePath string
 }
 
 func loadConfig() porterConfig {
@@ -29,6 +31,8 @@ func loadConfig() porterConfig {
 		WsPort:       viper.GetInt("ws-port"),
 		StatusEnable: viper.GetBool("status"),
 		StatusPort:   viper.GetInt("status-port"),
+		DuckLake:     viper.GetBool("ducklake"),
+		DuckLakePath: viper.GetString("ducklake-path"),
 	}
 }
 
