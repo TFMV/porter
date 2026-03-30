@@ -21,6 +21,7 @@ import (
 	"google.golang.org/grpc/status"
 
 	"github.com/TFMV/porter/internal/adbc"
+	"github.com/TFMV/porter/telemetry"
 )
 
 const (
@@ -66,6 +67,7 @@ type Config struct {
 	Logger               *slog.Logger
 	DevMode              bool
 	ADBCManager          *adbc.Manager
+	Telemetry            telemetry.Publisher
 }
 
 type Engine interface {
@@ -92,6 +94,7 @@ type engine struct {
 	nextQueryID     int64
 	closeOnce       sync.Once
 	tableLocks      sync.Map
+	telemetry       telemetry.Publisher
 }
 
 type IngestOptions struct {
@@ -168,6 +171,7 @@ func New(cfg Config) (Engine, error) {
 		Logger:             logger,
 		schemaProbeTimeout: schemaProbeTimeout,
 		activeQueries:      make(map[int64]context.CancelFunc),
+		telemetry:          cfg.Telemetry,
 	}
 
 	if cfg.MaxConcurrentQueries > 0 {
@@ -179,6 +183,13 @@ func New(cfg Config) (Engine, error) {
 
 func (e *engine) Allocator() memory.Allocator {
 	return e.Alloc
+}
+
+func (e *engine) publish(ctx context.Context, evt telemetry.Event) {
+	if e.telemetry == nil {
+		return
+	}
+	e.telemetry.Publish(telemetry.ScopedEvent(ctx, evt))
 }
 
 func (e *engine) Close() error {
@@ -231,6 +242,15 @@ func (e *engine) AcquireQuerySlot(ctx context.Context) error {
 	}
 	select {
 	case e.querySemaphore <- struct{}{}:
+		e.publish(ctx, telemetry.Event{
+			Component: telemetry.ComponentTransport,
+			Type:      telemetry.TypeQueueDepth,
+			Metadata: map[string]any{
+				"queue_depth":    len(e.querySemaphore),
+				"queue_capacity": cap(e.querySemaphore),
+				"queue_unit":     "slots",
+			},
+		})
 		return nil
 	case <-ctx.Done():
 		return ctx.Err()
@@ -242,6 +262,15 @@ func (e *engine) ReleaseQuerySlot() {
 		return
 	}
 	<-e.querySemaphore
+	e.publish(context.Background(), telemetry.Event{
+		Component: telemetry.ComponentTransport,
+		Type:      telemetry.TypeQueueDepth,
+		Metadata: map[string]any{
+			"queue_depth":    len(e.querySemaphore),
+			"queue_capacity": cap(e.querySemaphore),
+			"queue_unit":     "slots",
+		},
+	})
 }
 
 func (e *engine) DeriveSchema(ctx context.Context, sql string) (*arrow.Schema, error) {
@@ -287,6 +316,15 @@ func (e *engine) BuildStream(
 	params arrow.RecordBatch,
 ) (*arrow.Schema, <-chan StreamChunk, error) {
 	ctx, finishQuery := e.trackQuery(ctx)
+	started := time.Now()
+
+	e.publish(ctx, telemetry.Event{
+		Component: telemetry.ComponentExecution,
+		Type:      telemetry.TypeRequestStart,
+		Metadata: map[string]any{
+			"operation": "query",
+		},
+	})
 
 	cleanupParams := sync.Once{}
 	releaseParams := func() {
@@ -313,6 +351,15 @@ func (e *engine) BuildStream(
 	}
 
 	if err := e.AcquireQuerySlot(ctx); err != nil {
+		e.publish(ctx, telemetry.Event{
+			Component: telemetry.ComponentExecution,
+			Type:      telemetry.TypeError,
+			Latency:   time.Since(started),
+			Metadata: map[string]any{
+				"operation": "query",
+				"reason":    err.Error(),
+			},
+		})
 		abort()
 		return nil, nil, err
 	}
@@ -323,18 +370,45 @@ func (e *engine) BuildStream(
 
 	conn, err := e.db.Open(ctx)
 	if err != nil {
+		e.publish(ctx, telemetry.Event{
+			Component: telemetry.ComponentExecution,
+			Type:      telemetry.TypeError,
+			Latency:   time.Since(started),
+			Metadata: map[string]any{
+				"operation": "query",
+				"reason":    err.Error(),
+			},
+		})
 		abort()
 		return nil, nil, wrapInternal(err, "open db connection")
 	}
 
 	stmt, err := conn.NewStatement()
 	if err != nil {
+		e.publish(ctx, telemetry.Event{
+			Component: telemetry.ComponentExecution,
+			Type:      telemetry.TypeError,
+			Latency:   time.Since(started),
+			Metadata: map[string]any{
+				"operation": "query",
+				"reason":    err.Error(),
+			},
+		})
 		conn.Close()
 		abort()
 		return nil, nil, wrapInternal(err, "create statement")
 	}
 
 	if err := stmt.SetSqlQuery(sql); err != nil {
+		e.publish(ctx, telemetry.Event{
+			Component: telemetry.ComponentExecution,
+			Type:      telemetry.TypeError,
+			Latency:   time.Since(started),
+			Metadata: map[string]any{
+				"operation": "query",
+				"reason":    err.Error(),
+			},
+		})
 		stmt.Close()
 		conn.Close()
 		abort()
@@ -346,12 +420,30 @@ func (e *engine) BuildStream(
 
 	if params != nil {
 		if err := stmt.Prepare(ctx); err != nil {
+			e.publish(ctx, telemetry.Event{
+				Component: telemetry.ComponentExecution,
+				Type:      telemetry.TypeError,
+				Latency:   time.Since(started),
+				Metadata: map[string]any{
+					"operation": "query",
+					"reason":    err.Error(),
+				},
+			})
 			stmt.Close()
 			conn.Close()
 			abort()
 			return nil, nil, wrapInternal(err, "prepare statement")
 		}
 		if err := stmt.Bind(ctx, params); err != nil {
+			e.publish(ctx, telemetry.Event{
+				Component: telemetry.ComponentExecution,
+				Type:      telemetry.TypeError,
+				Latency:   time.Since(started),
+				Metadata: map[string]any{
+					"operation": "query",
+					"reason":    err.Error(),
+				},
+			})
 			stmt.Close()
 			conn.Close()
 			abort()
@@ -361,6 +453,15 @@ func (e *engine) BuildStream(
 
 	reader, _, err := stmt.ExecuteQuery(ctx)
 	if err != nil {
+		e.publish(ctx, telemetry.Event{
+			Component: telemetry.ComponentExecution,
+			Type:      telemetry.TypeError,
+			Latency:   time.Since(started),
+			Metadata: map[string]any{
+				"operation": "query",
+				"reason":    err.Error(),
+			},
+		})
 		stmt.Close()
 		conn.Close()
 		abort()
@@ -383,38 +484,105 @@ func (e *engine) BuildStream(
 		})
 	}
 
-	go pumpRecords(ctx, reader, cleanup, ch)
+	go pumpRecords(ctx, reader, cleanup, ch, e.telemetry, started)
 	return schema, ch, nil
 }
 
 func (e *engine) ExecuteUpdate(ctx context.Context, sql string) (int64, error) {
 	ctx, finishQuery := e.trackQuery(ctx)
 	defer finishQuery()
+	started := time.Now()
+
+	e.publish(ctx, telemetry.Event{
+		Component: telemetry.ComponentExecution,
+		Type:      telemetry.TypeRequestStart,
+		Metadata: map[string]any{
+			"operation": "update",
+		},
+	})
 
 	if err := e.AcquireQuerySlot(ctx); err != nil {
+		e.publish(ctx, telemetry.Event{
+			Component: telemetry.ComponentExecution,
+			Type:      telemetry.TypeError,
+			Latency:   time.Since(started),
+			Metadata: map[string]any{
+				"operation": "update",
+				"reason":    err.Error(),
+			},
+		})
 		return 0, err
 	}
 	defer e.ReleaseQuerySlot()
 
 	conn, err := e.db.Open(ctx)
 	if err != nil {
+		e.publish(ctx, telemetry.Event{
+			Component: telemetry.ComponentExecution,
+			Type:      telemetry.TypeError,
+			Latency:   time.Since(started),
+			Metadata: map[string]any{
+				"operation": "update",
+				"reason":    err.Error(),
+			},
+		})
 		return 0, wrapInternal(err, "open db connection")
 	}
 	defer conn.Close()
 
 	stmt, err := conn.NewStatement()
 	if err != nil {
+		e.publish(ctx, telemetry.Event{
+			Component: telemetry.ComponentExecution,
+			Type:      telemetry.TypeError,
+			Latency:   time.Since(started),
+			Metadata: map[string]any{
+				"operation": "update",
+				"reason":    err.Error(),
+			},
+		})
 		return 0, wrapInternal(err, "create statement")
 	}
 	defer stmt.Close()
 
 	if err := stmt.SetSqlQuery(sql); err != nil {
+		e.publish(ctx, telemetry.Event{
+			Component: telemetry.ComponentExecution,
+			Type:      telemetry.TypeError,
+			Latency:   time.Since(started),
+			Metadata: map[string]any{
+				"operation": "update",
+				"reason":    err.Error(),
+			},
+		})
 		if isInvalidArgument(err) {
 			return 0, ErrInvalidSQL
 		}
 		return 0, wrapInternal(err, "set sql query")
 	}
-	return stmt.ExecuteUpdate(ctx)
+	rows, err := stmt.ExecuteUpdate(ctx)
+	if err != nil {
+		e.publish(ctx, telemetry.Event{
+			Component: telemetry.ComponentExecution,
+			Type:      telemetry.TypeError,
+			Latency:   time.Since(started),
+			Metadata: map[string]any{
+				"operation": "update",
+				"reason":    err.Error(),
+			},
+		})
+		return 0, err
+	}
+	e.publish(ctx, telemetry.Event{
+		Component: telemetry.ComponentExecution,
+		Type:      telemetry.TypeRequestEnd,
+		Rows:      rows,
+		Latency:   time.Since(started),
+		Metadata: map[string]any{
+			"operation": "update",
+		},
+	})
+	return rows, nil
 }
 
 func (e *engine) lockForTable(table string) func() {
@@ -455,8 +623,28 @@ func (e *engine) IngestStream(ctx context.Context, table string, reader array.Re
 
 	ctx, finishQuery := e.trackQuery(ctx)
 	defer finishQuery()
+	started := time.Now()
+
+	e.publish(ctx, telemetry.Event{
+		Component: telemetry.ComponentExecution,
+		Type:      telemetry.TypeRequestStart,
+		Metadata: map[string]any{
+			"operation": "ingest",
+			"table":     table,
+		},
+	})
 
 	if err := e.AcquireQuerySlot(ctx); err != nil {
+		e.publish(ctx, telemetry.Event{
+			Component: telemetry.ComponentExecution,
+			Type:      telemetry.TypeError,
+			Latency:   time.Since(started),
+			Metadata: map[string]any{
+				"operation": "ingest",
+				"table":     table,
+				"reason":    err.Error(),
+			},
+		})
 		return 0, err
 	}
 	defer e.ReleaseQuerySlot()
@@ -466,6 +654,16 @@ func (e *engine) IngestStream(ctx context.Context, table string, reader array.Re
 
 	conn, err := e.db.Open(ctx)
 	if err != nil {
+		e.publish(ctx, telemetry.Event{
+			Component: telemetry.ComponentExecution,
+			Type:      telemetry.TypeError,
+			Latency:   time.Since(started),
+			Metadata: map[string]any{
+				"operation": "ingest",
+				"table":     table,
+				"reason":    err.Error(),
+			},
+		})
 		return 0, wrapInternal(err, "open db connection")
 	}
 	defer conn.Close()
@@ -485,24 +683,73 @@ func (e *engine) IngestStream(ctx context.Context, table string, reader array.Re
 		}
 	}
 	if err := reader.Err(); err != nil {
+		e.publish(ctx, telemetry.Event{
+			Component: telemetry.ComponentExecution,
+			Type:      telemetry.TypeError,
+			Latency:   time.Since(started),
+			Metadata: map[string]any{
+				"operation": "ingest",
+				"table":     table,
+				"reason":    err.Error(),
+			},
+		})
 		_ = conn.Rollback(ctx)
 		return 0, wrapInternal(err, "read first ingest batch")
 	}
 	if firstBatch == nil {
 		if err := conn.Commit(ctx); err != nil {
+			e.publish(ctx, telemetry.Event{
+				Component: telemetry.ComponentExecution,
+				Type:      telemetry.TypeError,
+				Latency:   time.Since(started),
+				Metadata: map[string]any{
+					"operation": "ingest",
+					"table":     table,
+					"reason":    err.Error(),
+				},
+			})
 			_ = conn.Rollback(ctx)
 			return 0, wrapInternal(err, "commit empty ingest stream")
 		}
+		e.publish(ctx, telemetry.Event{
+			Component: telemetry.ComponentExecution,
+			Type:      telemetry.TypeRequestEnd,
+			Latency:   time.Since(started),
+			Metadata: map[string]any{
+				"operation": "ingest",
+				"table":     table,
+			},
+		})
 		return 0, nil
 	}
 
 	sessionSchema := firstBatch.Schema()
 	targetSchema, err := resolveIngestTargetSchema(ctx, conn, table, sessionSchema, opts)
 	if err != nil {
+		e.publish(ctx, telemetry.Event{
+			Component: telemetry.ComponentExecution,
+			Type:      telemetry.TypeError,
+			Latency:   time.Since(started),
+			Metadata: map[string]any{
+				"operation": "ingest",
+				"table":     table,
+				"reason":    err.Error(),
+			},
+		})
 		_ = conn.Rollback(ctx)
 		return 0, err
 	}
 	if !sessionSchema.Equal(targetSchema) {
+		e.publish(ctx, telemetry.Event{
+			Component: telemetry.ComponentExecution,
+			Type:      telemetry.TypeError,
+			Latency:   time.Since(started),
+			Metadata: map[string]any{
+				"operation": "ingest",
+				"table":     table,
+				"reason":    "schema mismatch",
+			},
+		})
 		_ = conn.Rollback(ctx)
 		return 0, status.Errorf(codes.InvalidArgument, "ingest schema mismatch for table %q", table)
 	}
@@ -518,34 +765,133 @@ func (e *engine) IngestStream(ctx context.Context, table string, reader array.Re
 		if batch == nil {
 			return nil
 		}
-		return writer.Append(batch)
+		bytes := estimateBatchSizeBytes(batch)
+		if err := writer.Append(batch); err != nil {
+			return err
+		}
+		e.publish(ctx, telemetry.Event{
+			Component: telemetry.ComponentTransport,
+			Type:      telemetry.TypeBatch,
+			Rows:      batch.NumRows(),
+			Bytes:     bytes,
+			Metadata: map[string]any{
+				"operation": "ingest",
+				"table":     table,
+			},
+		})
+		e.publish(ctx, telemetry.Event{
+			Component: telemetry.ComponentTransport,
+			Type:      telemetry.TypeQueueDepth,
+			Rows:      batch.NumRows(),
+			Bytes:     bytes,
+			Metadata: map[string]any{
+				"operation":      "ingest",
+				"table":          table,
+				"queue_depth":    writer.pendingBytes,
+				"queue_capacity": writer.maxBytes,
+				"queue_unit":     "bytes",
+			},
+		})
+		return nil
 	}
 
 	if err := appendBatch(firstBatch); err != nil {
+		e.publish(ctx, telemetry.Event{
+			Component: telemetry.ComponentExecution,
+			Type:      telemetry.TypeError,
+			Latency:   time.Since(started),
+			Metadata: map[string]any{
+				"operation": "ingest",
+				"table":     table,
+				"reason":    err.Error(),
+			},
+		})
 		_ = conn.Rollback(ctx)
 		return 0, wrapPreservingCode(err, "append first segment")
 	}
 
 	for reader.Next() {
 		if err := appendBatch(reader.RecordBatch()); err != nil {
+			e.publish(ctx, telemetry.Event{
+				Component: telemetry.ComponentExecution,
+				Type:      telemetry.TypeError,
+				Latency:   time.Since(started),
+				Metadata: map[string]any{
+					"operation": "ingest",
+					"table":     table,
+					"reason":    err.Error(),
+				},
+			})
 			_ = conn.Rollback(ctx)
 			return 0, wrapPreservingCode(err, "append ingest segment")
 		}
 	}
 	if err := reader.Err(); err != nil {
+		e.publish(ctx, telemetry.Event{
+			Component: telemetry.ComponentExecution,
+			Type:      telemetry.TypeError,
+			Latency:   time.Since(started),
+			Metadata: map[string]any{
+				"operation": "ingest",
+				"table":     table,
+				"reason":    err.Error(),
+			},
+		})
 		_ = conn.Rollback(ctx)
 		return 0, wrapPreservingCode(err, "read ingest stream")
 	}
 
 	ingested, err := writer.Commit(ctx, conn)
 	if err != nil {
+		e.publish(ctx, telemetry.Event{
+			Component: telemetry.ComponentExecution,
+			Type:      telemetry.TypeError,
+			Latency:   time.Since(started),
+			Metadata: map[string]any{
+				"operation": "ingest",
+				"table":     table,
+				"reason":    err.Error(),
+			},
+		})
 		_ = conn.Rollback(ctx)
 		return 0, wrapPreservingCode(err, "publish ingest segments")
 	}
 	if err := conn.Commit(ctx); err != nil {
+		e.publish(ctx, telemetry.Event{
+			Component: telemetry.ComponentExecution,
+			Type:      telemetry.TypeError,
+			Latency:   time.Since(started),
+			Metadata: map[string]any{
+				"operation": "ingest",
+				"table":     table,
+				"reason":    err.Error(),
+			},
+		})
 		_ = conn.Rollback(ctx)
 		return 0, wrapInternal(err, "commit ingest transaction")
 	}
+	e.publish(ctx, telemetry.Event{
+		Component: telemetry.ComponentExecution,
+		Type:      telemetry.TypeRequestEnd,
+		Rows:      ingested,
+		Bytes:     writer.committedBytes,
+		Latency:   time.Since(started),
+		Metadata: map[string]any{
+			"operation": "ingest",
+			"table":     table,
+		},
+	})
+	e.publish(ctx, telemetry.Event{
+		Component: telemetry.ComponentTransport,
+		Type:      telemetry.TypeQueueDepth,
+		Metadata: map[string]any{
+			"operation":      "ingest",
+			"table":          table,
+			"queue_depth":    0,
+			"queue_capacity": writer.maxBytes,
+			"queue_unit":     "bytes",
+		},
+	})
 	return ingested, nil
 }
 
@@ -576,12 +922,13 @@ func (s immutableSegment) Release() {
 }
 
 type segmentWriter struct {
-	table        string
-	schema       *arrow.Schema
-	opts         IngestOptions
-	segments     []immutableSegment
-	pendingBytes int64
-	maxBytes     int64
+	table          string
+	schema         *arrow.Schema
+	opts           IngestOptions
+	segments       []immutableSegment
+	pendingBytes   int64
+	maxBytes       int64
+	committedBytes int64
 }
 
 func newSegmentWriter(table string, schema *arrow.Schema, opts IngestOptions, maxBytes int64) *segmentWriter {
@@ -618,6 +965,7 @@ func (w *segmentWriter) Commit(ctx context.Context, conn adbc_driver.Connection)
 		if err != nil {
 			return 0, err
 		}
+		w.committedBytes += seg.bytes
 		if n < 0 {
 			totalRows += seg.rows
 			continue
@@ -765,13 +1113,36 @@ func pumpRecords(
 	reader array.RecordReader,
 	cleanup func(),
 	ch chan<- StreamChunk,
+	publisher telemetry.Publisher,
+	started time.Time,
 ) {
 	defer close(ch)
 	defer cleanup()
+	var totalRows int64
+	var totalBytes int64
+	publish := func(evt telemetry.Event) {
+		if publisher == nil {
+			return
+		}
+		publisher.Publish(telemetry.ScopedEvent(ctx, evt))
+	}
 
 	for {
 		select {
 		case <-ctx.Done():
+			if totalRows > 0 || totalBytes > 0 {
+				publish(telemetry.Event{
+					Component: telemetry.ComponentExecution,
+					Type:      telemetry.TypeStall,
+					Rows:      totalRows,
+					Bytes:     totalBytes,
+					Latency:   time.Since(started),
+					Metadata: map[string]any{
+						"operation": "query",
+						"reason":    ctx.Err().Error(),
+					},
+				})
+			}
 			return
 		default:
 		}
@@ -791,21 +1162,68 @@ func pumpRecords(
 		}
 
 		rec.Retain()
+		rows := rec.NumRows()
+		bytes := estimateBatchSizeBytes(rec)
+		totalRows += rows
+		totalBytes += bytes
 
 		select {
 		case ch <- StreamChunk{Data: rec}:
+			publish(telemetry.Event{
+				Component: telemetry.ComponentExecution,
+				Type:      telemetry.TypeBatch,
+				Rows:      rows,
+				Bytes:     bytes,
+				Metadata: map[string]any{
+					"operation": "query",
+				},
+			})
 		case <-ctx.Done():
 			rec.Release()
+			publish(telemetry.Event{
+				Component: telemetry.ComponentExecution,
+				Type:      telemetry.TypeStall,
+				Rows:      totalRows,
+				Bytes:     totalBytes,
+				Latency:   time.Since(started),
+				Metadata: map[string]any{
+					"operation": "query",
+					"reason":    ctx.Err().Error(),
+				},
+			})
 			return
 		}
 	}
 
 	if err := reader.Err(); err != nil {
+		publish(telemetry.Event{
+			Component: telemetry.ComponentExecution,
+			Type:      telemetry.TypeError,
+			Rows:      totalRows,
+			Bytes:     totalBytes,
+			Latency:   time.Since(started),
+			Metadata: map[string]any{
+				"operation": "query",
+				"reason":    err.Error(),
+			},
+		})
 		select {
 		case ch <- StreamChunk{Err: wrapInternal(err, "record reader error")}:
 		case <-ctx.Done():
 		}
+		return
 	}
+
+	publish(telemetry.Event{
+		Component: telemetry.ComponentExecution,
+		Type:      telemetry.TypeRequestEnd,
+		Rows:      totalRows,
+		Bytes:     totalBytes,
+		Latency:   time.Since(started),
+		Metadata: map[string]any{
+			"operation": "query",
+		},
+	})
 }
 
 type BatchGuard struct {

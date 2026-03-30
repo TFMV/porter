@@ -19,6 +19,8 @@ bench/bench.parquet
 # Go workspace file
 go.work
 bench.db
+bench.db.wal
+porter
 duckdb/
 clickhouse-go/
 arrow-go/

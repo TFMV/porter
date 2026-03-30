@@ -77,7 +77,7 @@ func (f *fakeEngine) Close() error {
 func newTestServer(t *testing.T, eng *fakeEngine) *httptest.Server {
 	t.Helper()
 	// Pass io.Discard to avoid nil-pointer panic when writing logs
-	s := NewServer(eng, slog.New(slog.NewTextHandler(io.Discard, nil)), "*")
+	s := NewServer(eng, slog.New(slog.NewTextHandler(io.Discard, nil)), nil, "*")
 	return httptest.NewServer(s)
 }
 

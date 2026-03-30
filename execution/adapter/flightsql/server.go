@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/TFMV/porter/execution/engine"
+	"github.com/TFMV/porter/telemetry"
 	adbc_driver "github.com/apache/arrow-adbc/go/adbc"
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/flight"
@@ -93,6 +94,7 @@ type Server struct {
 
 	stopGC     chan struct{}
 	stopGCOnce sync.Once
+	Telemetry  telemetry.Publisher
 }
 
 type Config struct {
@@ -105,6 +107,7 @@ type Config struct {
 	Logger               *slog.Logger
 	DevMode              bool
 	Engine               Engine
+	Telemetry            telemetry.Publisher
 }
 
 func NewServer(cfg Config) (*Server, error) {
@@ -150,6 +153,7 @@ func NewServer(cfg Config) (*Server, error) {
 		queryHandles:  make(map[string]queryHandle),
 		preparedStmts: make(map[string]preparedEntry),
 		stopGC:        make(chan struct{}),
+		Telemetry:     cfg.Telemetry,
 	}
 
 	go srv.runGC()
@@ -254,6 +258,13 @@ func (s *Server) deriveSchema(ctx context.Context, sql string) (*arrow.Schema, e
 	return s.Engine.DeriveSchema(ctx, sql)
 }
 
+func (s *Server) publish(ctx context.Context, evt telemetry.Event) {
+	if s.Telemetry == nil {
+		return
+	}
+	s.Telemetry.Publish(telemetry.ScopedEvent(ctx, evt))
+}
+
 // ─── BACKPRESSURE-AWARE STREAMING ─────────────────────────────────────────────
 
 func (s *Server) buildStream(
@@ -262,6 +273,95 @@ func (s *Server) buildStream(
 	params arrow.RecordBatch,
 ) (*arrow.Schema, <-chan flight.StreamChunk, error) {
 	return s.Engine.BuildStream(ctx, sql, params)
+}
+
+func (s *Server) instrumentStream(
+	ctx context.Context,
+	streamCh <-chan flight.StreamChunk,
+	path string,
+	operation string,
+	started time.Time,
+) <-chan flight.StreamChunk {
+	out := make(chan flight.StreamChunk, 1)
+	go func() {
+		defer close(out)
+		var totalRows int64
+		var totalBytes int64
+
+		for chunk := range streamCh {
+			if chunk.Err != nil {
+				s.publish(ctx, telemetry.Event{
+					Component: telemetry.ComponentEgress,
+					Type:      telemetry.TypeError,
+					Rows:      totalRows,
+					Bytes:     totalBytes,
+					Latency:   time.Since(started),
+					Metadata: map[string]any{
+						"path":          path,
+						"operation":     operation,
+						"reason":        chunk.Err.Error(),
+						"path_terminal": true,
+					},
+				})
+				out <- chunk
+				return
+			}
+
+			if chunk.Data != nil {
+				rows := chunk.Data.NumRows()
+				bytes := estimateRecordBatchBytes(chunk.Data)
+				totalRows += rows
+				totalBytes += bytes
+				s.publish(ctx, telemetry.Event{
+					Component: telemetry.ComponentEgress,
+					Type:      telemetry.TypeBatch,
+					Rows:      rows,
+					Bytes:     bytes,
+					Metadata: map[string]any{
+						"path":          path,
+						"operation":     operation,
+						"path_terminal": true,
+					},
+				})
+			}
+
+			select {
+			case out <- chunk:
+			case <-ctx.Done():
+				if chunk.Data != nil {
+					chunk.Data.Release()
+				}
+				s.publish(ctx, telemetry.Event{
+					Component: telemetry.ComponentEgress,
+					Type:      telemetry.TypeStall,
+					Rows:      totalRows,
+					Bytes:     totalBytes,
+					Latency:   time.Since(started),
+					Metadata: map[string]any{
+						"path":          path,
+						"operation":     operation,
+						"reason":        ctx.Err().Error(),
+						"path_terminal": true,
+					},
+				})
+				return
+			}
+		}
+
+		s.publish(ctx, telemetry.Event{
+			Component: telemetry.ComponentEgress,
+			Type:      telemetry.TypeRequestEnd,
+			Rows:      totalRows,
+			Bytes:     totalBytes,
+			Latency:   time.Since(started),
+			Metadata: map[string]any{
+				"path":          path,
+				"operation":     operation,
+				"path_terminal": true,
+			},
+		})
+	}()
+	return out
 }
 
 // ingestStreamReader adapts the Flight DoPut stream to the engine's Arrow
@@ -278,6 +378,8 @@ type ingestStreamReader struct {
 	src         flight.MessageReader
 	firstSchema *arrow.Schema
 	err         error
+	seenRows    int64
+	seenBytes   int64
 }
 
 func newIngestStreamReader(src flight.MessageReader) (*ingestStreamReader, error) {
@@ -311,6 +413,9 @@ func (r *ingestStreamReader) Next() bool {
 	if rec == nil {
 		return true
 	}
+
+	r.seenRows += rec.NumRows()
+	r.seenBytes += estimateRecordBatchBytes(rec)
 
 	if r.firstSchema == nil {
 		r.firstSchema = rec.Schema()
@@ -460,6 +565,7 @@ func (s *Server) DoGetStatement(
 	ctx context.Context,
 	ticket fsql.StatementQueryTicket,
 ) (*arrow.Schema, <-chan flight.StreamChunk, error) {
+	started := time.Now()
 	handle := string(ticket.GetStatementHandle())
 
 	s.handlesMu.Lock()
@@ -470,10 +576,57 @@ func (s *Server) DoGetStatement(
 	s.handlesMu.Unlock()
 
 	if !ok || h.isExpired() {
+		s.publish(ctx, telemetry.Event{
+			Component: telemetry.ComponentIngress,
+			Type:      telemetry.TypeError,
+			Latency:   time.Since(started),
+			Metadata: map[string]any{
+				"path":          "flightsql",
+				"operation":     "query",
+				"reason":        "statement handle not found",
+				"path_terminal": true,
+			},
+		})
 		return nil, nil, ErrNotFound
 	}
 
-	return s.buildStream(ctx, h.sql, nil)
+	scopedCtx := telemetry.WithScope(ctx, map[string]any{
+		"path":      "flightsql",
+		"operation": "query",
+	})
+	s.publish(scopedCtx, telemetry.Event{
+		Component: telemetry.ComponentIngress,
+		Type:      telemetry.TypeRequestStart,
+		Metadata: map[string]any{
+			"path":      "flightsql",
+			"operation": "query",
+		},
+	})
+	schema, streamCh, err := s.buildStream(scopedCtx, h.sql, nil)
+	if err != nil {
+		s.publish(scopedCtx, telemetry.Event{
+			Component: telemetry.ComponentIngress,
+			Type:      telemetry.TypeError,
+			Latency:   time.Since(started),
+			Metadata: map[string]any{
+				"path":          "flightsql",
+				"operation":     "query",
+				"reason":        err.Error(),
+				"path_terminal": true,
+			},
+		})
+		return nil, nil, err
+	}
+	s.publish(scopedCtx, telemetry.Event{
+		Component: telemetry.ComponentIngress,
+		Type:      telemetry.TypeRequestEnd,
+		Latency:   time.Since(started),
+		Metadata: map[string]any{
+			"path":      "flightsql",
+			"operation": "query",
+		},
+	})
+	return schema, s.instrumentStream(scopedCtx, streamCh, "flightsql", "query", started), nil
 }
 
 // ─── PREPARED STATEMENTS ──────────────────────────────────────────────────────
@@ -637,6 +790,7 @@ func (s *Server) DoGetPreparedStatement(
 	ctx context.Context,
 	cmd fsql.PreparedStatementQuery,
 ) (*arrow.Schema, <-chan flight.StreamChunk, error) {
+	started := time.Now()
 	handle := string(cmd.GetPreparedStatementHandle())
 
 	s.handlesMu.Lock()
@@ -655,22 +809,119 @@ func (s *Server) DoGetPreparedStatement(
 	s.handlesMu.Unlock()
 
 	if !ok {
+		s.publish(ctx, telemetry.Event{
+			Component: telemetry.ComponentIngress,
+			Type:      telemetry.TypeError,
+			Latency:   time.Since(started),
+			Metadata: map[string]any{
+				"path":          "flightsql",
+				"operation":     "prepared_query",
+				"reason":        "prepared statement not found",
+				"path_terminal": true,
+			},
+		})
 		return nil, nil, ErrNotFound
 	}
 
-	return s.buildStream(ctx, e.sql, boundParams)
+	scopedCtx := telemetry.WithScope(ctx, map[string]any{
+		"path":      "flightsql",
+		"operation": "prepared_query",
+	})
+	s.publish(scopedCtx, telemetry.Event{
+		Component: telemetry.ComponentIngress,
+		Type:      telemetry.TypeRequestStart,
+		Metadata: map[string]any{
+			"path":      "flightsql",
+			"operation": "prepared_query",
+		},
+	})
+	schema, streamCh, err := s.buildStream(scopedCtx, e.sql, boundParams)
+	if err != nil {
+		s.publish(scopedCtx, telemetry.Event{
+			Component: telemetry.ComponentIngress,
+			Type:      telemetry.TypeError,
+			Latency:   time.Since(started),
+			Metadata: map[string]any{
+				"path":          "flightsql",
+				"operation":     "prepared_query",
+				"reason":        err.Error(),
+				"path_terminal": true,
+			},
+		})
+		return nil, nil, err
+	}
+	s.publish(scopedCtx, telemetry.Event{
+		Component: telemetry.ComponentIngress,
+		Type:      telemetry.TypeRequestEnd,
+		Latency:   time.Since(started),
+		Metadata: map[string]any{
+			"path":      "flightsql",
+			"operation": "prepared_query",
+		},
+	})
+	return schema, s.instrumentStream(scopedCtx, streamCh, "flightsql", "prepared_query", started), nil
 }
 
 func (s *Server) DoPutCommandStatementUpdate(
 	ctx context.Context,
 	cmd fsql.StatementUpdate,
 ) (int64, error) {
+	started := time.Now()
 	sql := cmd.GetQuery()
 	if sql == "" {
+		s.publish(ctx, telemetry.Event{
+			Component: telemetry.ComponentIngress,
+			Type:      telemetry.TypeError,
+			Latency:   time.Since(started),
+			Metadata: map[string]any{
+				"path":          "flightsql",
+				"operation":     "update",
+				"reason":        "empty query",
+				"path_terminal": true,
+			},
+		})
 		return 0, ErrEmptyQuery
 	}
 
-	return s.Engine.ExecuteUpdate(ctx, sql)
+	scopedCtx := telemetry.WithScope(ctx, map[string]any{
+		"path":      "flightsql",
+		"operation": "update",
+	})
+	s.publish(scopedCtx, telemetry.Event{
+		Component: telemetry.ComponentIngress,
+		Type:      telemetry.TypeRequestStart,
+		Metadata: map[string]any{
+			"path":      "flightsql",
+			"operation": "update",
+		},
+	})
+	rows, err := s.Engine.ExecuteUpdate(scopedCtx, sql)
+	if err != nil {
+		s.publish(scopedCtx, telemetry.Event{
+			Component: telemetry.ComponentIngress,
+			Type:      telemetry.TypeError,
+			Latency:   time.Since(started),
+			Metadata: map[string]any{
+				"path":          "flightsql",
+				"operation":     "update",
+				"reason":        err.Error(),
+				"path_terminal": true,
+			},
+		})
+		return 0, err
+	}
+	s.publish(scopedCtx, telemetry.Event{
+		Component: telemetry.ComponentIngress,
+		Type:      telemetry.TypeRequestEnd,
+		Rows:      rows,
+		Latency:   time.Since(started),
+		Metadata: map[string]any{
+			"path":          "flightsql",
+			"operation":     "update",
+			"path_terminal": true,
+		},
+	})
+	return rows, nil
 }
 
 func (s *Server) DoPutCommandStatementIngest(
@@ -678,25 +929,113 @@ func (s *Server) DoPutCommandStatementIngest(
 	cmd fsql.StatementIngest,
 	reader flight.MessageReader,
 ) (int64, error) {
+	started := time.Now()
 	table := cmd.GetTable()
 	if table == "" {
+		s.publish(ctx, telemetry.Event{
+			Component: telemetry.ComponentIngress,
+			Type:      telemetry.TypeError,
+			Latency:   time.Since(started),
+			Metadata: map[string]any{
+				"path":          "ingest",
+				"operation":     "ingest",
+				"reason":        "ingest table is required",
+				"path_terminal": true,
+			},
+		})
 		return 0, status.Error(codes.InvalidArgument, "ingest table is required")
 	}
 	if reader == nil {
+		s.publish(ctx, telemetry.Event{
+			Component: telemetry.ComponentIngress,
+			Type:      telemetry.TypeError,
+			Latency:   time.Since(started),
+			Metadata: map[string]any{
+				"path":          "ingest",
+				"operation":     "ingest",
+				"reason":        "ingest stream reader is required",
+				"path_terminal": true,
+			},
+		})
 		return 0, status.Error(codes.InvalidArgument, "ingest stream reader is required")
 	}
 
 	streamReader, err := newIngestStreamReader(reader)
 	if err != nil {
+		s.publish(ctx, telemetry.Event{
+			Component: telemetry.ComponentIngress,
+			Type:      telemetry.TypeError,
+			Latency:   time.Since(started),
+			Metadata: map[string]any{
+				"path":          "ingest",
+				"operation":     "ingest",
+				"reason":        err.Error(),
+				"path_terminal": true,
+			},
+		})
 		return 0, err
 	}
 
 	ingestOpts, err := buildIngestOptions(cmd)
 	if err != nil {
+		s.publish(ctx, telemetry.Event{
+			Component: telemetry.ComponentIngress,
+			Type:      telemetry.TypeError,
+			Latency:   time.Since(started),
+			Metadata: map[string]any{
+				"path":          "ingest",
+				"operation":     "ingest",
+				"reason":        err.Error(),
+				"path_terminal": true,
+			},
+		})
 		return 0, err
 	}
 
-	return s.Engine.IngestStream(ctx, table, streamReader, ingestOpts)
+	scopedCtx := telemetry.WithScope(ctx, map[string]any{
+		"path":      "ingest",
+		"operation": "ingest",
+	})
+	s.publish(scopedCtx, telemetry.Event{
+		Component: telemetry.ComponentIngress,
+		Type:      telemetry.TypeRequestStart,
+		Metadata: map[string]any{
+			"path":      "ingest",
+			"operation": "ingest",
+			"table":     table,
+		},
+	})
+	rows, err := s.Engine.IngestStream(scopedCtx, table, streamReader, ingestOpts)
+	if err != nil {
+		s.publish(scopedCtx, telemetry.Event{
+			Component: telemetry.ComponentIngress,
+			Type:      telemetry.TypeError,
+			Latency:   time.Since(started),
+			Metadata: map[string]any{
+				"path":          "ingest",
+				"operation":     "ingest",
+				"table":         table,
+				"reason":        err.Error(),
+				"path_terminal": true,
+			},
+		})
+		return 0, err
+	}
+	s.publish(scopedCtx, telemetry.Event{
+		Component: telemetry.ComponentIngress,
+		Type:      telemetry.TypeRequestEnd,
+		Rows:      rows,
+		Bytes:     streamReader.seenBytes,
+		Latency:   time.Since(started),
+		Metadata: map[string]any{
+			"path":          "ingest",
+			"operation":     "ingest",
+			"table":         table,
+			"path_summary":  true,
+			"path_terminal": true,
+		},
+	})
+	return rows, nil
 }
 
 // ─── DOEXCHANGE (ZERO-COPY DIRECT STREAMING) ──────────────────────────────────
@@ -749,24 +1088,90 @@ func (s *Server) readFlightDataParameterBatch(firstMsg *flight.FlightData, strea
 	return params, nil
 }
 
+func estimateRecordBatchBytes(batch arrow.RecordBatch) int64 {
+	if batch == nil {
+		return 0
+	}
+	var total int64
+	for i := 0; i < int(batch.NumCols()); i++ {
+		data := batch.Column(i).Data()
+		if data == nil {
+			continue
+		}
+		for _, buf := range data.Buffers() {
+			if buf != nil {
+				total += int64(buf.Len())
+			}
+		}
+	}
+	return total
+}
+
 // DoExchange operates outside the BaseServer routing and allows us to bypass channels entirely
 // for true, zero-copy, synchronous streaming.
 func (s *Server) DoExchange(
 	ctx context.Context,
 	stream flight.FlightService_DoExchangeServer,
 ) error {
+	started := time.Now()
 	msg, err := stream.Recv()
 	if err != nil {
+		s.publish(ctx, telemetry.Event{
+			Component: telemetry.ComponentIngress,
+			Type:      telemetry.TypeError,
+			Latency:   time.Since(started),
+			Metadata: map[string]any{
+				"path":          "flightsql",
+				"operation":     "exchange",
+				"reason":        err.Error(),
+				"path_terminal": true,
+			},
+		})
 		return status.Errorf(codes.InvalidArgument, "recv first message: %v", err)
 	}
 	if msg == nil || msg.GetFlightDescriptor() == nil {
+		s.publish(ctx, telemetry.Event{
+			Component: telemetry.ComponentIngress,
+			Type:      telemetry.TypeError,
+			Latency:   time.Since(started),
+			Metadata: map[string]any{
+				"path":          "flightsql",
+				"operation":     "exchange",
+				"reason":        "missing FlightDescriptor",
+				"path_terminal": true,
+			},
+		})
 		return status.Error(codes.InvalidArgument, "missing FlightDescriptor")
 	}
 
 	sql := string(msg.GetFlightDescriptor().GetCmd())
 	if sql == "" {
+		s.publish(ctx, telemetry.Event{
+			Component: telemetry.ComponentIngress,
+			Type:      telemetry.TypeError,
+			Latency:   time.Since(started),
+			Metadata: map[string]any{
+				"path":          "flightsql",
+				"operation":     "exchange",
+				"reason":        "empty query",
+				"path_terminal": true,
+			},
+		})
 		return ErrEmptyQuery
 	}
+
+	scopedCtx := telemetry.WithScope(ctx, map[string]any{
+		"path":      "flightsql",
+		"operation": "exchange",
+	})
+	s.publish(scopedCtx, telemetry.Event{
+		Component: telemetry.ComponentIngress,
+		Type:      telemetry.TypeRequestStart,
+		Metadata: map[string]any{
+			"path":      "flightsql",
+			"operation": "exchange",
+		},
+	})
 
 	var params arrow.RecordBatch
 	var readErr error
@@ -781,34 +1186,144 @@ func (s *Server) DoExchange(
 		}
 	}
 	if readErr != nil {
+		s.publish(scopedCtx, telemetry.Event{
+			Component: telemetry.ComponentIngress,
+			Type:      telemetry.TypeError,
+			Latency:   time.Since(started),
+			Metadata: map[string]any{
+				"path":          "flightsql",
+				"operation":     "exchange",
+				"reason":        readErr.Error(),
+				"path_terminal": true,
+			},
+		})
 		return readErr
 	}
 
 	// buildStream will inherently track this execution through trackQuery
-	schema, ch, err := s.buildStream(ctx, sql, params)
+	schema, ch, err := s.buildStream(scopedCtx, sql, params)
 	if err != nil {
+		s.publish(scopedCtx, telemetry.Event{
+			Component: telemetry.ComponentIngress,
+			Type:      telemetry.TypeError,
+			Latency:   time.Since(started),
+			Metadata: map[string]any{
+				"path":          "flightsql",
+				"operation":     "exchange",
+				"reason":        err.Error(),
+				"path_terminal": true,
+			},
+		})
 		return err
 	}
 
+	s.publish(scopedCtx, telemetry.Event{
+		Component: telemetry.ComponentIngress,
+		Type:      telemetry.TypeRequestEnd,
+		Latency:   time.Since(started),
+		Metadata: map[string]any{
+			"path":      "flightsql",
+			"operation": "exchange",
+		},
+	})
+
 	writer := flight.NewRecordWriter(stream, ipc.WithSchema(schema), ipc.WithAllocator(s.Alloc))
 	defer writer.Close()
+	var totalRows int64
+	var totalBytes int64
 
 	for chunk := range ch {
 		if chunk.Err != nil {
+			s.publish(scopedCtx, telemetry.Event{
+				Component: telemetry.ComponentEgress,
+				Type:      telemetry.TypeError,
+				Rows:      totalRows,
+				Bytes:     totalBytes,
+				Latency:   time.Since(started),
+				Metadata: map[string]any{
+					"path":          "flightsql",
+					"operation":     "exchange",
+					"reason":        chunk.Err.Error(),
+					"path_terminal": true,
+				},
+			})
 			return chunk.Err
 		}
 
+		writeStarted := time.Now()
 		if err := writer.Write(chunk.Data); err != nil {
+			rows := int64(0)
+			bytes := int64(0)
+			if chunk.Data != nil {
+				rows = chunk.Data.NumRows()
+				bytes = estimateRecordBatchBytes(chunk.Data)
+			}
 			chunk.Data.Release()
+			s.publish(scopedCtx, telemetry.Event{
+				Component: telemetry.ComponentEgress,
+				Type:      telemetry.TypeError,
+				Rows:      totalRows + rows,
+				Bytes:     totalBytes + bytes,
+				Latency:   time.Since(started),
+				Metadata: map[string]any{
+					"path":          "flightsql",
+					"operation":     "exchange",
+					"reason":        err.Error(),
+					"path_terminal": true,
+				},
+			})
 			return wrapInternal(err, "write stream chunk")
+		}
+		if chunk.Data != nil {
+			rows := chunk.Data.NumRows()
+			bytes := estimateRecordBatchBytes(chunk.Data)
+			totalRows += rows
+			totalBytes += bytes
+			s.publish(scopedCtx, telemetry.Event{
+				Component: telemetry.ComponentEgress,
+				Type:      telemetry.TypeBatch,
+				Rows:      rows,
+				Bytes:     bytes,
+				Latency:   time.Since(writeStarted),
+				Metadata: map[string]any{
+					"path":          "flightsql",
+					"operation":     "exchange",
+					"path_terminal": true,
+				},
+			})
 		}
 		chunk.Data.Release()
 
 		if ctx.Err() != nil {
+			s.publish(scopedCtx, telemetry.Event{
+				Component: telemetry.ComponentEgress,
+				Type:      telemetry.TypeStall,
+				Rows:      totalRows,
+				Bytes:     totalBytes,
+				Latency:   time.Since(started),
+				Metadata: map[string]any{
+					"path":          "flightsql",
+					"operation":     "exchange",
+					"reason":        ctx.Err().Error(),
+					"path_terminal": true,
+				},
+			})
 			return ErrCancelled
 		}
 	}
 
+	s.publish(scopedCtx, telemetry.Event{
+		Component: telemetry.ComponentEgress,
+		Type:      telemetry.TypeRequestEnd,
+		Rows:      totalRows,
+		Bytes:     totalBytes,
+		Latency:   time.Since(started),
+		Metadata: map[string]any{
+			"path":          "flightsql",
+			"operation":     "exchange",
+			"path_terminal": true,
+		},
+	})
 	return nil
 }
 

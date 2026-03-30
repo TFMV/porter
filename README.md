@@ -45,6 +45,7 @@ See the [Benchmark Report](bench/bench_results.md) for details.
 * Native DuckDB execution via ADBC
 * Full prepared statement lifecycle with parameter binding
 * TTL-based handle management with background GC
+* Live status surface with pipeline flow, pressure, and backpressure visibility
 
 ---
 
@@ -105,6 +106,7 @@ Defaults:
 
 * Flight SQL: `0.0.0.0:32010`
 * WebSocket: `0.0.0.0:8080` (when `--ws` enabled)
+* Status: `0.0.0.0:9091` (enabled by default)
 * Database: in-memory (`:memory:`)
 
 ---
@@ -169,6 +171,7 @@ porter serve        # Same as above
 porter --ws                        # Flight SQL + WebSocket
 porter serve --ws                   # Same as above
 porter serve --ws --ws-port 9090   # Custom WebSocket port
+porter serve --status-port 9191    # Custom status surface
 ```
 
 ### Full Flags
@@ -179,6 +182,8 @@ porter serve --ws --ws-port 9090   # Custom WebSocket port
 | `--port` | Flight SQL port | `32010` |
 | `--ws` | Enable WebSocket | `false` |
 | `--ws-port` | WebSocket port | `8080` |
+| `--status` | Enable live status surface | `true` |
+| `--status-port` | Status server port | `9091` |
 
 ### Execute a query
 
@@ -210,6 +215,29 @@ porter schema table_name
 * `PORTER_PORT`
 * `PORTER_WS`
 * `PORTER_WS_PORT`
+* `PORTER_STATUS`
+* `PORTER_STATUS_PORT`
+
+---
+
+## Live Status Surface
+
+Porter now exposes a dedicated status server with a living cross-section of the pipeline:
+
+* `/status` — live instrument panel UI
+* `/status/live` — current JSON snapshot
+* `/status/stream` — SSE stream of snapshots
+* `/status/history` — rolling snapshot history
+* `/status/health` — deterministic health status
+
+The flow view tracks:
+
+* `ingress -> transport -> execution -> egress`
+* rows/sec and MB/sec per stage
+* queue depth and pressure buildup
+* p50/p95/p99 latency divergence
+* live structured activity feed
+* WebSocket vs FlightSQL vs ingest path comparison
 
 ---
 
@@ -306,6 +334,12 @@ Backpressure is enforced naturally via the channel boundary.
 - [ ] Session context
 - [ ] Improved schema probing
 - [ ] Benchmark suite
+
+---
+
+Porter includes a system status page.
+
+![Porter Status](assets/porter-status.png)
 
 ---
 

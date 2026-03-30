@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/TFMV/porter/execution/engine"
+	"github.com/TFMV/porter/telemetry"
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/ipc"
 	"github.com/coder/websocket"
@@ -80,6 +81,7 @@ type sendItem struct {
 	streamID   string
 	batchIndex int
 	numRows    int
+	numBytes   int
 	buf        *bytes.Buffer
 }
 
@@ -88,10 +90,11 @@ type sendItem struct {
 type Server struct {
 	Engine         Engine
 	Logger         *slog.Logger
+	Telemetry      telemetry.Publisher
 	OriginPatterns []string
 }
 
-func NewServer(engine Engine, logger *slog.Logger, origins ...string) *Server {
+func NewServer(engine Engine, logger *slog.Logger, publisher telemetry.Publisher, origins ...string) *Server {
 	if logger == nil {
 		logger = slog.Default()
 	}
@@ -101,6 +104,7 @@ func NewServer(engine Engine, logger *slog.Logger, origins ...string) *Server {
 	return &Server{
 		Engine:         engine,
 		Logger:         logger,
+		Telemetry:      publisher,
 		OriginPatterns: origins,
 	}
 }
@@ -113,7 +117,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.Logger.Error("websocket accept failed", slog.Any("err", err))
 		return
 	}
-	h := &streamHandler{conn: conn, engine: s.Engine, logger: s.Logger}
+	h := &streamHandler{conn: conn, engine: s.Engine, logger: s.Logger, telemetry: s.Telemetry}
 	h.serve(r.Context())
 }
 
@@ -123,6 +127,7 @@ type streamHandler struct {
 	conn      *websocket.Conn
 	engine    Engine
 	logger    *slog.Logger
+	telemetry telemetry.Publisher
 	closeOnce sync.Once
 }
 
@@ -149,12 +154,24 @@ type streamHandler struct {
 //
 // Fix: close with StatusNormalClosure immediately after "complete".
 func (h *streamHandler) serve(ctx context.Context) {
+	requestStarted := time.Now()
 	var req QueryRequest
 	readCtx, cancel := context.WithTimeout(ctx, queryReadTimeout)
 	err := wsjson.Read(readCtx, h.conn, &req)
 	cancel()
 
 	if err != nil {
+		h.publish(ctx, telemetry.Event{
+			Component: telemetry.ComponentIngress,
+			Type:      telemetry.TypeError,
+			Latency:   time.Since(requestStarted),
+			Metadata: map[string]any{
+				"path":          "websocket",
+				"operation":     "query",
+				"reason":        err.Error(),
+				"path_terminal": true,
+			},
+		})
 		if isDisconnect(err) {
 			h.close(websocket.StatusNormalClosure, "")
 		} else {
@@ -164,15 +181,46 @@ func (h *streamHandler) serve(ctx context.Context) {
 	}
 
 	if req.Query == "" {
+		h.publish(ctx, telemetry.Event{
+			Component: telemetry.ComponentIngress,
+			Type:      telemetry.TypeError,
+			Latency:   time.Since(requestStarted),
+			Metadata: map[string]any{
+				"path":          "websocket",
+				"operation":     "query",
+				"reason":        "empty query",
+				"path_terminal": true,
+			},
+		})
 		h.close(websocket.StatusUnsupportedData, "empty query")
 		return
 	}
 
-	if err := h.processQuery(ctx, req); err != nil {
+	h.publish(ctx, telemetry.Event{
+		Component: telemetry.ComponentIngress,
+		Type:      telemetry.TypeRequestStart,
+		Metadata: map[string]any{
+			"path":      "websocket",
+			"operation": "query",
+		},
+	})
+
+	if err := h.processQuery(ctx, req, requestStarted); err != nil {
 		if isDisconnect(err) {
 			h.close(websocket.StatusNormalClosure, "")
 			return
 		}
+		h.publish(ctx, telemetry.Event{
+			Component: telemetry.ComponentEgress,
+			Type:      telemetry.TypeError,
+			Latency:   time.Since(requestStarted),
+			Metadata: map[string]any{
+				"path":          "websocket",
+				"operation":     "query",
+				"reason":        err.Error(),
+				"path_terminal": true,
+			},
+		})
 		h.logger.Error("query failed", slog.Any("err", err))
 		_ = h.writeControlWithTimeout(ctx, ControlMessage{
 			Type:  "error",
@@ -188,10 +236,14 @@ func (h *streamHandler) serve(ctx context.Context) {
 	h.close(websocket.StatusNormalClosure, "")
 }
 
-func (h *streamHandler) processQuery(ctx context.Context, req QueryRequest) error {
+func (h *streamHandler) processQuery(ctx context.Context, req QueryRequest, requestStarted time.Time) error {
 	streamID := fmt.Sprintf("req-%d", time.Now().UnixNano())
 
-	execCtx, cancel := context.WithCancel(ctx)
+	execCtx := telemetry.WithScope(ctx, map[string]any{
+		"path":      "websocket",
+		"operation": "query",
+	})
+	execCtx, cancel := context.WithCancel(execCtx)
 	defer cancel()
 
 	schema, streamCh, err := h.engine.BuildStream(execCtx, req.Query, nil)
@@ -203,6 +255,16 @@ func (h *streamHandler) processQuery(ctx context.Context, req QueryRequest) erro
 		})
 		return err
 	}
+
+	h.publish(ctx, telemetry.Event{
+		Component: telemetry.ComponentIngress,
+		Type:      telemetry.TypeRequestEnd,
+		Latency:   time.Since(requestStarted),
+		Metadata: map[string]any{
+			"path":      "websocket",
+			"operation": "query",
+		},
+	})
 
 	// Drain any unconsumed chunks so the engine can free its resources even
 	// when we return early due to a send error.
@@ -218,7 +280,7 @@ func (h *streamHandler) processQuery(ctx context.Context, req QueryRequest) erro
 		return err
 	}
 
-	return h.stream(ctx, streamID, schema, streamCh)
+	return h.stream(ctx, streamID, schema, streamCh, requestStarted)
 }
 
 // stream is the core data pipeline.
@@ -266,6 +328,7 @@ func (h *streamHandler) stream(
 	streamID string,
 	schema *arrow.Schema,
 	streamCh <-chan engine.StreamChunk,
+	requestStarted time.Time,
 ) error {
 	sendQ := make(chan sendItem, sendQueueDepth)
 	senderDone := make(chan error, 1)
@@ -285,7 +348,7 @@ func (h *streamHandler) stream(
 	}()
 
 	// ── Serialisation loop ────────────────────────────────────────────────────
-	serErr := h.serializeAndQueue(ctx, streamID, schema, streamCh, sendQ)
+	rows, bytes, serErr := h.serializeAndQueue(ctx, streamID, schema, streamCh, sendQ)
 
 	// Closing sendQ signals the sender's range loop to exit.
 	close(sendQ)
@@ -300,6 +363,31 @@ func (h *streamHandler) stream(
 	if senderErr != nil {
 		return senderErr
 	}
+
+	h.publish(ctx, telemetry.Event{
+		Component: telemetry.ComponentTransport,
+		Type:      telemetry.TypeQueueDepth,
+		Metadata: map[string]any{
+			"path":           "websocket",
+			"operation":      "query",
+			"queue_depth":    0,
+			"queue_capacity": cap(sendQ),
+			"queue_unit":     "batches",
+		},
+	})
+
+	h.publish(ctx, telemetry.Event{
+		Component: telemetry.ComponentEgress,
+		Type:      telemetry.TypeRequestEnd,
+		Rows:      rows,
+		Bytes:     bytes,
+		Latency:   time.Since(requestStarted),
+		Metadata: map[string]any{
+			"path":          "websocket",
+			"operation":     "query",
+			"path_terminal": true,
+		},
+	})
 
 	// All batches delivered; notify client before the connection is closed.
 	return h.writeControlWithTimeout(ctx, ControlMessage{
@@ -316,15 +404,17 @@ func (h *streamHandler) serializeAndQueue(
 	schema *arrow.Schema,
 	streamCh <-chan engine.StreamChunk,
 	sendQ chan<- sendItem,
-) error {
+) (int64, int64, error) {
 	batchIdx := 0
+	var totalRows int64
+	var totalBytes int64
 
 	for chunk := range streamCh {
 		if chunk.Err != nil {
 			if chunk.Data != nil {
 				chunk.Data.Release()
 			}
-			return chunk.Err
+			return totalRows, totalBytes, chunk.Err
 		}
 		if chunk.Data == nil {
 			continue
@@ -350,15 +440,17 @@ func (h *streamHandler) serializeAndQueue(
 		if encErr != nil || closeErr != nil {
 			bufPool.Put(buf)
 			if encErr != nil {
-				return encErr
+				return totalRows, totalBytes, encErr
 			}
-			return closeErr
+			return totalRows, totalBytes, closeErr
 		}
 
+		byteCount := buf.Len()
 		item := sendItem{
 			streamID:   streamID,
 			batchIndex: batchIdx,
 			numRows:    rows,
+			numBytes:   byteCount,
 			buf:        buf,
 		}
 
@@ -366,14 +458,50 @@ func (h *streamHandler) serializeAndQueue(
 		// buffer and return immediately rather than leaking it.
 		select {
 		case sendQ <- item:
+			totalRows += int64(rows)
+			totalBytes += int64(byteCount)
+			h.publish(ctx, telemetry.Event{
+				Component: telemetry.ComponentTransport,
+				Type:      telemetry.TypeBatch,
+				Rows:      int64(rows),
+				Bytes:     int64(byteCount),
+				Metadata: map[string]any{
+					"path":      "websocket",
+					"operation": "query",
+				},
+			})
+			h.publish(ctx, telemetry.Event{
+				Component: telemetry.ComponentTransport,
+				Type:      telemetry.TypeQueueDepth,
+				Rows:      int64(rows),
+				Bytes:     int64(byteCount),
+				Metadata: map[string]any{
+					"path":           "websocket",
+					"operation":      "query",
+					"queue_depth":    len(sendQ),
+					"queue_capacity": cap(sendQ),
+					"queue_unit":     "batches",
+				},
+			})
 			batchIdx++
 		case <-ctx.Done():
 			bufPool.Put(buf)
-			return ctx.Err()
+			h.publish(ctx, telemetry.Event{
+				Component: telemetry.ComponentTransport,
+				Type:      telemetry.TypeStall,
+				Rows:      totalRows,
+				Bytes:     totalBytes,
+				Metadata: map[string]any{
+					"path":      "websocket",
+					"operation": "query",
+					"reason":    ctx.Err().Error(),
+				},
+			})
+			return totalRows, totalBytes, ctx.Err()
 		}
 	}
 
-	return nil
+	return totalRows, totalBytes, nil
 }
 
 // sendBatch sends one record batch over the wire:
@@ -397,7 +525,23 @@ func (h *streamHandler) sendBatch(ctx context.Context, item sendItem) error {
 
 	wCtx, cancel := context.WithTimeout(ctx, writeTimeout)
 	defer cancel()
-	return h.conn.Write(wCtx, websocket.MessageBinary, item.buf.Bytes())
+	started := time.Now()
+	if err := h.conn.Write(wCtx, websocket.MessageBinary, item.buf.Bytes()); err != nil {
+		return err
+	}
+	h.publish(ctx, telemetry.Event{
+		Component: telemetry.ComponentEgress,
+		Type:      telemetry.TypeBatch,
+		Rows:      int64(item.numRows),
+		Bytes:     int64(item.numBytes),
+		Latency:   time.Since(started),
+		Metadata: map[string]any{
+			"path":          "websocket",
+			"operation":     "query",
+			"path_terminal": true,
+		},
+	})
+	return nil
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -420,6 +564,13 @@ func (h *streamHandler) writeControlWithTimeout(ctx context.Context, msg Control
 	wCtx, cancel := context.WithTimeout(ctx, writeTimeout)
 	defer cancel()
 	return wsjson.Write(wCtx, h.conn, msg)
+}
+
+func (h *streamHandler) publish(ctx context.Context, evt telemetry.Event) {
+	if h.telemetry == nil {
+		return
+	}
+	h.telemetry.Publish(telemetry.ScopedEvent(ctx, evt))
 }
 
 func (h *streamHandler) close(code websocket.StatusCode, reason string) {
