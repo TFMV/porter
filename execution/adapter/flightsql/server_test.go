@@ -8,9 +8,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/TFMV/porter/execution/engine"
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
 	"github.com/apache/arrow-go/v18/arrow/flight"
+	fsql "github.com/apache/arrow-go/v18/arrow/flight/flightsql"
 	"github.com/apache/arrow-go/v18/arrow/memory"
 )
 
@@ -53,6 +55,27 @@ func (r *fakeMessageReader) Chunk() flight.StreamChunk                        { 
 func (r *fakeMessageReader) LatestFlightDescriptor() *flight.FlightDescriptor { return nil }
 func (r *fakeMessageReader) LatestAppMetadata() []byte                        { return nil }
 
+type ingestCaptureEngine struct {
+	table string
+	calls int32
+}
+
+func (e *ingestCaptureEngine) BuildStream(context.Context, string, arrow.RecordBatch) (*arrow.Schema, <-chan engine.StreamChunk, error) {
+	return nil, nil, nil
+}
+func (e *ingestCaptureEngine) IngestStream(context.Context, string, array.RecordReader, engine.IngestOptions) (int64, error) {
+	atomic.AddInt32(&e.calls, 1)
+	return 5, nil
+}
+func (e *ingestCaptureEngine) AcquireQuerySlot(context.Context) error { return nil }
+func (e *ingestCaptureEngine) ReleaseQuerySlot()                      {}
+func (e *ingestCaptureEngine) DeriveSchema(context.Context, string) (*arrow.Schema, error) {
+	return nil, nil
+}
+func (e *ingestCaptureEngine) ExecuteUpdate(context.Context, string) (int64, error) { return 0, nil }
+func (e *ingestCaptureEngine) Allocator() memory.Allocator                          { return memory.NewGoAllocator() }
+func (e *ingestCaptureEngine) Close() error                                         { return nil }
+
 type testPreparedStatementQuery struct {
 	handle []byte
 }
@@ -60,6 +83,18 @@ type testPreparedStatementQuery struct {
 func (q testPreparedStatementQuery) GetPreparedStatementHandle() []byte {
 	return q.handle
 }
+
+type testStatementIngest struct {
+	table string
+}
+
+func (t testStatementIngest) GetTableDefinitionOptions() *fsql.TableDefinitionOptions { return nil }
+func (t testStatementIngest) GetTable() string                                        { return t.table }
+func (t testStatementIngest) GetSchema() string                                       { return "" }
+func (t testStatementIngest) GetCatalog() string                                      { return "" }
+func (t testStatementIngest) GetTemporary() bool                                      { return false }
+func (t testStatementIngest) GetTransactionId() []byte                                { return nil }
+func (t testStatementIngest) GetOptions() map[string]string                           { return nil }
 
 func makeInt32Batch(t *testing.T, values []int32) arrow.RecordBatch {
 	t.Helper()
@@ -251,6 +286,25 @@ func TestDoPutPreparedStatementQueryConcurrent(t *testing.T) {
 	}
 
 	e.paramGuard.Release()
+}
+
+func TestDoPutCommandStatementIngest(t *testing.T) {
+	eng := &ingestCaptureEngine{}
+	s := &Server{Engine: eng}
+	batch := makeInt32Batch(t, []int32{1, 2, 3, 4, 5})
+	defer batch.Release()
+	reader := &fakeMessageReader{batches: []arrow.RecordBatch{batch}}
+
+	count, err := s.DoPutCommandStatementIngest(context.Background(), testStatementIngest{table: "ingest_target"}, reader)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if count != 5 {
+		t.Fatalf("expected row count 5, got %d", count)
+	}
+	if atomic.LoadInt32(&eng.calls) != 1 {
+		t.Fatalf("expected ingest call count 1, got %d", eng.calls)
+	}
 }
 
 func TestDoGetPreparedStatementConcurrentReaders(t *testing.T) {

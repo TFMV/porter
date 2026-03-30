@@ -534,6 +534,29 @@ func (s *Server) DoPutCommandStatementUpdate(
 	return s.Engine.ExecuteUpdate(ctx, sql)
 }
 
+func (s *Server) DoPutCommandStatementIngest(
+	ctx context.Context,
+	cmd fsql.StatementIngest,
+	reader flight.MessageReader,
+) (int64, error) {
+	table := cmd.GetTable()
+	if table == "" {
+		return 0, status.Error(codes.InvalidArgument, "ingest table is required")
+	}
+	if reader == nil {
+		return 0, status.Error(codes.InvalidArgument, "ingest stream reader is required")
+	}
+
+	ingestOpts := engine.IngestOptions{
+		Catalog:      cmd.GetCatalog(),
+		DBSchema:     cmd.GetSchema(),
+		Temporary:    cmd.GetTemporary(),
+		ExtraOptions: cmd.GetOptions(),
+	}
+
+	return s.Engine.IngestStream(ctx, table, reader, ingestOpts)
+}
+
 // ─── DOEXCHANGE (ZERO-COPY DIRECT STREAMING) ──────────────────────────────────
 
 type flightDataStreamReader struct {

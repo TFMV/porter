@@ -13,6 +13,7 @@ import (
 	"github.com/TFMV/porter/execution/engine"
 	"github.com/TFMV/porter/testutil/arrowtest"
 	"github.com/apache/arrow-go/v18/arrow"
+	"github.com/apache/arrow-go/v18/arrow/array"
 	"github.com/apache/arrow-go/v18/arrow/flight"
 	"github.com/apache/arrow-go/v18/arrow/memory"
 	"github.com/coder/websocket"
@@ -54,6 +55,10 @@ func (f *fakeEngine) DeriveSchema(ctx context.Context, sql string) (*arrow.Schem
 }
 
 func (f *fakeEngine) ExecuteUpdate(ctx context.Context, sql string) (int64, error) {
+	return 0, nil
+}
+
+func (f *fakeEngine) IngestStream(ctx context.Context, table string, reader array.RecordReader, opts engine.IngestOptions) (int64, error) {
 	return 0, nil
 }
 
