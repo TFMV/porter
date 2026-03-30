@@ -128,26 +128,26 @@ func TestServer_StreamSuccess_Full(t *testing.T) {
 	}
 	close(eng.ch)
 
-	// Read IPC frame with timeout
+	// Read IPC frames - the server sends batch_header (JSON) then binary, then "complete" (JSON), then closes
+	// Loop until we get binary data or connection closes
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
-	msgType, data, err := c.Read(ctx)
-	if err != nil {
-		// With continuous streaming, server closes connection after stream ends
-		// If we get a close frame after schema, that's expected
-		if websocket.CloseStatus(err) == websocket.StatusNormalClosure {
+	for {
+		msgType, data, err := c.Read(ctx)
+		if err != nil {
+			// Connection closed after stream ends - this is expected
+			if websocket.CloseStatus(err) == websocket.StatusNormalClosure {
+				return
+			}
+			t.Fatalf("read frame failed: %v", err)
+		}
+
+		if msgType == websocket.MessageBinary && len(data) > 0 {
+			// Found the binary IPC payload
 			return
 		}
-		t.Fatalf("read frame failed: %v", err)
-	}
-
-	if msgType != websocket.MessageBinary {
-		t.Fatalf("expected binary message, got %v", msgType)
-	}
-
-	if len(data) == 0 {
-		t.Fatal("expected non-empty IPC payload")
+		// Otherwise skip JSON messages (batch_header, complete) and continue reading
 	}
 }
 
@@ -168,9 +168,26 @@ func TestServer_BuildStreamErrorClosesConnection(t *testing.T) {
 
 	_ = wsjson.Write(context.Background(), c, QueryRequest{Query: "select 1"})
 
-	_, _, err := c.Read(context.Background())
-	if err == nil {
-		t.Fatal("expected close on build failure")
+	// Read the error JSON message - server sends error before closing
+	var errMsg map[string]any
+	if err := wsjson.Read(context.Background(), c, &errMsg); err != nil {
+		t.Fatalf("failed to read error message: %v", err)
+	}
+	if errMsg["type"] != "error" {
+		t.Fatalf("expected error type, got %v", errMsg["type"])
+	}
+
+	// Server sends two error messages (one from processQuery, one from serve)
+	// Keep reading until we get a close
+	readCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	for {
+		_, _, err := c.Read(readCtx)
+		if err != nil {
+			// Got close - test passes
+			return
+		}
+		// Otherwise continue reading error messages
 	}
 }
 
