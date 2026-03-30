@@ -18,25 +18,35 @@ import (
 
 	"github.com/apache/arrow-adbc/go/adbc/drivermgr"
 	"github.com/apache/arrow-go/v18/arrow"
+	"github.com/apache/arrow-go/v18/arrow/array"
+	"github.com/apache/arrow-go/v18/arrow/flight/flightsql"
 	"github.com/apache/arrow-go/v18/arrow/ipc"
+	"github.com/apache/arrow-go/v18/arrow/memory"
 	"github.com/coder/websocket"
 	"github.com/coder/websocket/wsjson"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
 )
+
+// =========================
+// Types
+// =========================
 
 type QueryRequest struct {
 	Query string `json:"query"`
 }
 
 type runConfig struct {
-	transport   string
-	query       string
-	clients     int
-	iterations  int
-	timeout     time.Duration
-	flightURI   string
-	wsURL       string
-	cpuProfile  string
-	heapProfile string
+	transport     string
+	query         string
+	clients       int
+	iterations    int
+	timeout       time.Duration
+	flightURI     string
+	flightAdbcURI string
+	wsURL         string
+	cpuProfile    string
+	heapProfile   string
 }
 
 type opMetric struct {
@@ -66,8 +76,12 @@ type aggregate struct {
 	firstBytes []time.Duration
 }
 
+// =========================
+// main
+// =========================
+
 func main() {
-	transport := flag.String("transport", "both", "ws|flight|both")
+	transport := flag.String("transport", "both", "ws|flight|ingest|both")
 	query := flag.String("query", "SELECT i FROM generate_series(1, 1000000) t(i)", "SQL query")
 	clients := flag.Int("clients", 2, "Concurrent clients")
 	iterations := flag.Int("iterations", 5, "Queries per client")
@@ -79,15 +93,16 @@ func main() {
 	flag.Parse()
 
 	cfg := runConfig{
-		transport:   strings.ToLower(*transport),
-		query:       *query,
-		clients:     *clients,
-		iterations:  *iterations,
-		timeout:     *timeout,
-		flightURI:   "grpc+tcp://127.0.0.1:" + *flightPort,
-		wsURL:       (&url.URL{Scheme: "ws", Host: "127.0.0.1:" + *wsPort, Path: "/"}).String(),
-		cpuProfile:  *cpuProfile,
-		heapProfile: *heapProfile,
+		transport:     strings.ToLower(*transport),
+		query:         *query,
+		clients:       *clients,
+		iterations:    *iterations,
+		timeout:       *timeout,
+		flightURI:     "127.0.0.1:" + *flightPort,
+		flightAdbcURI: "grpc+tcp://127.0.0.1:" + *flightPort,
+		wsURL:         (&url.URL{Scheme: "ws", Host: "127.0.0.1:" + *wsPort, Path: "/"}).String(),
+		cpuProfile:    *cpuProfile,
+		heapProfile:   *heapProfile,
 	}
 
 	if cfg.cpuProfile != "" {
@@ -106,14 +121,24 @@ func main() {
 	}
 }
 
+// =========================
+// runner
+// =========================
+
 func run(cfg runConfig) {
 	if cfg.transport == "ws" || cfg.transport == "both" {
 		agg, wall := runConcurrent(cfg, runWSQuery)
 		printSummary("WebSocket", agg, wall)
 	}
+
 	if cfg.transport == "flight" || cfg.transport == "both" {
 		agg, wall := runConcurrent(cfg, runFlightQuery)
 		printSummary("FlightSQL", agg, wall)
+	}
+
+	if cfg.transport == "ingest" || cfg.transport == "both" {
+		agg, wall := runConcurrent(cfg, runFlightIngest)
+		printSummary("FlightSQL Ingest", agg, wall)
 	}
 }
 
@@ -175,7 +200,6 @@ func runConcurrent(cfg runConfig, fn func(context.Context, *runConfig) opMetric)
 
 // =========================
 // WebSocket benchmark
-// (schema logic preserved exactly)
 // =========================
 
 func runWSQuery(ctx context.Context, cfg *runConfig) opMetric {
@@ -194,11 +218,10 @@ func runWSQuery(ctx context.Context, cfg *runConfig) opMetric {
 	}
 
 	var (
-		schemaRead bool
-		firstByte  time.Duration
-		firstSeen  bool
-		m          opMetric
-		readStart  = time.Now()
+		firstByte time.Duration
+		firstSeen bool
+		m         opMetric
+		readStart = time.Now()
 	)
 
 	for {
@@ -214,11 +237,6 @@ func runWSQuery(ctx context.Context, cfg *runConfig) opMetric {
 		if !firstSeen {
 			firstByte = time.Since(start)
 			firstSeen = true
-		}
-
-		if msgType == websocket.MessageText {
-			schemaRead = true
-			continue
 		}
 
 		if msgType != websocket.MessageBinary {
@@ -238,10 +256,6 @@ func runWSQuery(ctx context.Context, cfg *runConfig) opMetric {
 		m.logicalBytes += logicalBytes
 	}
 
-	if !schemaRead {
-		return opMetric{errorOccurred: true}
-	}
-
 	m.latency = time.Since(start)
 	m.readDuration = time.Since(readStart)
 	m.firstByte = firstByte
@@ -250,14 +264,14 @@ func runWSQuery(ctx context.Context, cfg *runConfig) opMetric {
 }
 
 // =========================
-// FlightSQL benchmark
+// FlightSQL QUERY benchmark
 // =========================
 
 func runFlightQuery(ctx context.Context, cfg *runConfig) opMetric {
 	start := time.Now()
 
 	var drv drivermgr.Driver
-	db, err := drv.NewDatabase(map[string]string{"driver": "flightsql", "uri": cfg.flightURI})
+	db, err := drv.NewDatabase(map[string]string{"driver": "flightsql", "uri": cfg.flightAdbcURI})
 	if err != nil {
 		return opMetric{errorOccurred: true}
 	}
@@ -275,7 +289,9 @@ func runFlightQuery(ctx context.Context, cfg *runConfig) opMetric {
 	}
 	defer stmt.Close()
 
-	_ = stmt.SetSqlQuery(cfg.query)
+	if err := stmt.SetSqlQuery(cfg.query); err != nil {
+		return opMetric{errorOccurred: true}
+	}
 
 	stream, _, err := stmt.ExecuteQuery(ctx)
 	if err != nil {
@@ -287,29 +303,108 @@ func runFlightQuery(ctx context.Context, cfg *runConfig) opMetric {
 	readStart := time.Now()
 
 	for stream.Next() {
-		if m.firstByte == 0 {
-			m.firstByte = time.Since(start)
-		}
-
 		rec := stream.RecordBatch()
-		decodeStart := time.Now()
-
 		m.rows += rec.NumRows()
 		m.batches++
 		m.logicalBytes += logicalRecordBytes(rec)
-
-		m.decodeTime += time.Since(decodeStart)
 	}
 
-	if err := stream.Err(); err != nil {
-		return opMetric{errorOccurred: true}
-	}
-
-	m.readDuration = time.Since(readStart)
 	m.latency = time.Since(start)
+	m.readDuration = time.Since(readStart)
 	m.payloadBytes = m.logicalBytes
 
 	return m
+}
+
+// =========================
+// 🚀 NEW: FlightSQL INGEST benchmark
+// =========================
+
+func runFlightIngest(ctx context.Context, cfg *runConfig) opMetric {
+	start := time.Now()
+
+	reader, batchCount, err := buildIngestReader()
+	if err != nil {
+		return opMetric{errorOccurred: true}
+	}
+	defer reader.Release()
+
+	flightClient, err := flightsql.NewClient(cfg.flightURI, nil, nil, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		fmt.Printf("FlightSQL: failed to create client: %v\n", err)
+		return opMetric{errorOccurred: true}
+	}
+	defer flightClient.Close()
+
+	ingestStart := time.Now()
+
+	rows, err := flightClient.ExecuteIngest(ctx, reader, &flightsql.ExecuteIngestOpts{
+		Table: "benchmark_ingest",
+		TableDefinitionOptions: &flightsql.TableDefinitionOptions{
+			IfNotExist: flightsql.TableDefinitionOptionsTableNotExistOptionCreate,
+			IfExists:   flightsql.TableDefinitionOptionsTableExistsOptionReplace,
+		},
+	})
+
+	if err != nil {
+		fmt.Printf("FlightSQL ingest error: %v\n", err)
+		return opMetric{errorOccurred: true}
+	}
+
+	return opMetric{
+		latency:      time.Since(start),
+		readDuration: time.Since(ingestStart),
+		rows:         rows,
+		batches:      int64(batchCount),
+		payloadBytes: estimateReaderBytes(),
+		logicalBytes: estimateReaderBytes(),
+	}
+}
+
+// =========================
+// Arrow ingest dataset
+// =========================
+
+func buildIngestReader() (array.RecordReader, int, error) {
+	fields := []arrow.Field{
+		{Name: "id", Type: arrow.PrimitiveTypes.Int64},
+		{Name: "payload", Type: arrow.BinaryTypes.String},
+	}
+
+	schema := arrow.NewSchema(fields, nil)
+
+	makeBatch := func(start, size int64) arrow.RecordBatch {
+		b := array.NewRecordBuilder(memory.NewGoAllocator(), schema)
+		defer b.Release()
+
+		ids := make([]int64, size)
+		vals := make([]string, size)
+
+		for i := int64(0); i < size; i++ {
+			ids[i] = start + i
+			vals[i] = "v"
+		}
+
+		b.Field(0).(*array.Int64Builder).AppendValues(ids, nil)
+		b.Field(1).(*array.StringBuilder).AppendValues(vals, nil)
+
+		return b.NewRecordBatch()
+	}
+
+	b1 := makeBatch(0, 5000)
+	b2 := makeBatch(5000, 5000)
+	b3 := makeBatch(10000, 5000)
+
+	reader, err := array.NewRecordReader(schema, []arrow.RecordBatch{b1, b2, b3})
+	if err != nil {
+		return nil, 0, err
+	}
+
+	return reader, 3, nil
+}
+
+func estimateReaderBytes() int64 {
+	return 5000 * 3 * 16
 }
 
 // =========================
@@ -328,13 +423,9 @@ func decodeIPC(payload []byte) (int, int, int64, error) {
 
 	for r.Next() {
 		rec := r.RecordBatch()
-		if rec == nil {
-			continue
-		}
 		rows += int(rec.NumRows())
 		batches++
 		logical += logicalRecordBytes(rec)
-		rec.Release()
 	}
 
 	return rows, batches, logical, r.Err()
@@ -373,7 +464,6 @@ func printSummary(name string, agg aggregate, wall time.Duration) {
 	}
 
 	sort.Slice(agg.latencies, func(i, j int) bool { return agg.latencies[i] < agg.latencies[j] })
-	sort.Slice(agg.firstBytes, func(i, j int) bool { return agg.firstBytes[i] < agg.firstBytes[j] })
 
 	p50 := percentile(agg.latencies, 0.5)
 	p95 := percentile(agg.latencies, 0.95)

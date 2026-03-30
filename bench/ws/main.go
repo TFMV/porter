@@ -37,7 +37,7 @@ type BenchmarkResult struct {
 }
 
 var (
-	port     = flag.String("port", "8080", "WebSocket server port")
+	port     = flag.String("port", "9090", "WebSocket server port")
 	queries  = flag.String("queries", "", "Comma-separated queries to benchmark")
 	clients  = flag.Int("clients", 1, "Number of concurrent clients")
 	duration = flag.Int("duration", 5, "Duration of benchmark in seconds")
