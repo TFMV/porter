@@ -28,7 +28,7 @@ type SchemaMessage struct {
 }
 
 func main() {
-	port := flag.String("port", "8080", "WebSocket server port")
+	port := flag.String("port", "9090", "WebSocket server port")
 	query := flag.String("query", "", "SQL query to execute")
 	flag.Parse()
 
