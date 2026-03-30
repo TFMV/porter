@@ -6,8 +6,11 @@ import (
 	"log"
 
 	"github.com/apache/arrow-adbc/go/adbc/drivermgr"
+	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
 	"github.com/apache/arrow-go/v18/arrow/flight"
+	fsql "github.com/apache/arrow-go/v18/arrow/flight/flightsql"
+	"github.com/apache/arrow-go/v18/arrow/memory"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 )
@@ -40,6 +43,12 @@ func main() {
 		log.Fatal("Open:", err)
 	}
 	defer conn.Close()
+
+	flightSQLClient, err := fsql.NewClient("127.0.0.1:32010", nil, nil, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		log.Fatal("FlightSQL client:", err)
+	}
+	defer flightSQLClient.Close()
 
 	// ─────────────────────────────────────────────
 	// 3. Simple query execution
@@ -182,6 +191,101 @@ func main() {
 	printStream(stream4)
 
 	// ─────────────────────────────────────────────
+	// 8. IngestStream test (Arrow bulk ingest path)
+	// ─────────────────────────────────────────────
+	fmt.Println("\n=== ExecuteIngest (Arrow Bulk Ingest) ===")
+
+	ingestSQL := `DROP TABLE IF EXISTS ingest_demo`
+
+	upd2, err := conn.NewStatement()
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer upd2.Close()
+
+	if err := upd2.SetSqlQuery(ingestSQL); err != nil {
+		log.Fatal(err)
+	}
+
+	if _, err := upd2.ExecuteUpdate(ctx); err != nil {
+		log.Fatal("reset ingest table:", err)
+	}
+
+	// ─────────────────────────────────────────────
+	// Build Arrow schema + batches
+	// ─────────────────────────────────────────────
+	fields := []arrow.Field{
+		{Name: "id", Type: arrow.PrimitiveTypes.Int64, Nullable: true},
+		{Name: "name", Type: arrow.BinaryTypes.String, Nullable: true},
+	}
+	ingestSchema := arrow.NewSchema(fields, nil)
+
+	makeBatch := func(ids []int64, names []string) arrow.RecordBatch {
+		b := array.NewRecordBuilder(memory.NewGoAllocator(), ingestSchema)
+		defer b.Release()
+
+		b.Field(0).(*array.Int64Builder).AppendValues(ids, nil)
+		b.Field(1).(*array.StringBuilder).AppendValues(names, nil)
+
+		return b.NewRecordBatch()
+	}
+
+	rec1 := makeBatch([]int64{1, 2}, []string{"a", "b"})
+	rec2 := makeBatch([]int64{3, 4}, []string{"c", "d"})
+	rec3 := makeBatch([]int64{5, 6}, []string{"e", "f"})
+
+	defer rec1.Release()
+	defer rec2.Release()
+	defer rec3.Release()
+
+	// ─────────────────────────────────────────────
+	// Correct Arrow RecordReader
+	// ─────────────────────────────────────────────
+	reader, err := array.NewRecordReader(ingestSchema, []arrow.RecordBatch{
+		rec1, rec2, rec3,
+	})
+	if err != nil {
+		log.Fatal("record reader:", err)
+	}
+	defer reader.Release()
+
+	// ─────────────────────────────────────────────
+	// Execute ingest
+	// ─────────────────────────────────────────────
+	rowsIngested, err := flightSQLClient.ExecuteIngest(ctx, reader, &fsql.ExecuteIngestOpts{
+		TableDefinitionOptions: &fsql.TableDefinitionOptions{
+			IfNotExist: fsql.TableDefinitionOptionsTableNotExistOptionCreate,
+			IfExists:   fsql.TableDefinitionOptionsTableExistsOptionReplace,
+		},
+		Table: "ingest_demo",
+	})
+	if err != nil {
+		log.Fatal("ExecuteIngest failed:", err)
+	}
+
+	fmt.Println("rows ingested:", rowsIngested)
+
+	// ─────────────────────────────────────────────
+	// verify
+	// ─────────────────────────────────────────────
+	verify2, err := conn.NewStatement()
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer verify2.Close()
+
+	if err := verify2.SetSqlQuery(`SELECT COUNT(*) FROM ingest_demo`); err != nil {
+		log.Fatal(err)
+	}
+
+	stream5, _, err := verify2.ExecuteQuery(ctx)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	printStream(stream5)
+
+	// ─────────────────────────────────────────────
 	// 9. DoExchange test
 	// ─────────────────────────────────────────────
 	fmt.Println("\n=== DoExchange ===")
@@ -245,3 +349,33 @@ func printStream(stream array.RecordReader) {
 		log.Fatal("stream error:", err)
 	}
 }
+
+type testRecordReader struct {
+	schema *arrow.Schema
+	recs   []arrow.RecordBatch
+	i      int
+}
+
+func (t *testRecordReader) Retain() {}
+
+func (t *testRecordReader) Schema() *arrow.Schema {
+	return t.schema
+}
+
+func (t *testRecordReader) Next() bool {
+	if t.i >= len(t.recs) {
+		return false
+	}
+	t.i++
+	return true
+}
+
+func (t *testRecordReader) RecordBatch() arrow.RecordBatch {
+	return t.recs[t.i-1]
+}
+
+func (t *testRecordReader) Err() error {
+	return nil
+}
+
+func (t *testRecordReader) Release() {}

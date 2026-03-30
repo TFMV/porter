@@ -3,15 +3,25 @@ package server
 import (
 	"context"
 	"io"
+	"log/slog"
+	"net"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/TFMV/porter/execution/engine"
+	"github.com/TFMV/porter/internal/adbc"
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
 	"github.com/apache/arrow-go/v18/arrow/flight"
+	fsql "github.com/apache/arrow-go/v18/arrow/flight/flightsql"
 	"github.com/apache/arrow-go/v18/arrow/memory"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/status"
+	"google.golang.org/grpc/test/bufconn"
 )
 
 type fakeMessageReader struct {
@@ -53,6 +63,51 @@ func (r *fakeMessageReader) Chunk() flight.StreamChunk                        { 
 func (r *fakeMessageReader) LatestFlightDescriptor() *flight.FlightDescriptor { return nil }
 func (r *fakeMessageReader) LatestAppMetadata() []byte                        { return nil }
 
+type ingestCaptureEngine struct {
+	table       string
+	calls       int32
+	updateCalls int32
+	seenRows    int64
+	seenBatches int
+	lastOpts    engine.IngestOptions
+	lastSchema  *arrow.Schema
+}
+
+func (e *ingestCaptureEngine) BuildStream(context.Context, string, arrow.RecordBatch) (*arrow.Schema, <-chan engine.StreamChunk, error) {
+	return nil, nil, nil
+}
+func (e *ingestCaptureEngine) IngestStream(_ context.Context, table string, reader array.RecordReader, opts engine.IngestOptions) (int64, error) {
+	atomic.AddInt32(&e.calls, 1)
+	e.table = table
+	e.lastOpts = opts
+	for reader.Next() {
+		rec := reader.RecordBatch()
+		if rec == nil {
+			continue
+		}
+		e.seenBatches++
+		e.seenRows += rec.NumRows()
+		if e.lastSchema == nil {
+			e.lastSchema = rec.Schema()
+		}
+	}
+	if err := reader.Err(); err != nil {
+		return 0, err
+	}
+	return e.seenRows, nil
+}
+func (e *ingestCaptureEngine) AcquireQuerySlot(context.Context) error { return nil }
+func (e *ingestCaptureEngine) ReleaseQuerySlot()                      {}
+func (e *ingestCaptureEngine) DeriveSchema(context.Context, string) (*arrow.Schema, error) {
+	return nil, nil
+}
+func (e *ingestCaptureEngine) ExecuteUpdate(context.Context, string) (int64, error) {
+	atomic.AddInt32(&e.updateCalls, 1)
+	return 0, nil
+}
+func (e *ingestCaptureEngine) Allocator() memory.Allocator { return memory.NewGoAllocator() }
+func (e *ingestCaptureEngine) Close() error                { return nil }
+
 type testPreparedStatementQuery struct {
 	handle []byte
 }
@@ -60,6 +115,18 @@ type testPreparedStatementQuery struct {
 func (q testPreparedStatementQuery) GetPreparedStatementHandle() []byte {
 	return q.handle
 }
+
+type testStatementIngest struct {
+	table string
+}
+
+func (t testStatementIngest) GetTableDefinitionOptions() *fsql.TableDefinitionOptions { return nil }
+func (t testStatementIngest) GetTable() string                                        { return t.table }
+func (t testStatementIngest) GetSchema() string                                       { return "" }
+func (t testStatementIngest) GetCatalog() string                                      { return "" }
+func (t testStatementIngest) GetTemporary() bool                                      { return false }
+func (t testStatementIngest) GetTransactionId() []byte                                { return nil }
+func (t testStatementIngest) GetOptions() map[string]string                           { return nil }
 
 func makeInt32Batch(t *testing.T, values []int32) arrow.RecordBatch {
 	t.Helper()
@@ -251,6 +318,276 @@ func TestDoPutPreparedStatementQueryConcurrent(t *testing.T) {
 	}
 
 	e.paramGuard.Release()
+}
+
+func TestDoPutCommandStatementIngest(t *testing.T) {
+	eng := &ingestCaptureEngine{}
+	s := &Server{Engine: eng}
+	batch1 := makeInt32Batch(t, []int32{1, 2})
+	defer batch1.Release()
+	batch2 := makeInt32Batch(t, []int32{3, 4, 5})
+	defer batch2.Release()
+	reader := &fakeMessageReader{batches: []arrow.RecordBatch{batch1, batch2}}
+
+	count, err := s.DoPutCommandStatementIngest(context.Background(), testStatementIngest{table: "ingest_target"}, reader)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if count != 5 {
+		t.Fatalf("expected row count 5, got %d", count)
+	}
+	if atomic.LoadInt32(&eng.calls) != 1 {
+		t.Fatalf("expected ingest call count 1, got %d", eng.calls)
+	}
+	if atomic.LoadInt32(&eng.updateCalls) != 0 {
+		t.Fatalf("expected SQL fallback path to remain unused, got %d ExecuteUpdate calls", eng.updateCalls)
+	}
+	if eng.seenBatches != 2 {
+		t.Fatalf("expected 2 streamed batches, got %d", eng.seenBatches)
+	}
+	if eng.lastSchema == nil {
+		t.Fatal("expected streaming reader to preserve the first batch schema")
+	}
+}
+
+type gatedEngine struct {
+	engine.Engine
+	blockBefore int
+	blocked     chan struct{}
+	release     chan struct{}
+}
+
+func (g *gatedEngine) IngestStream(ctx context.Context, table string, reader array.RecordReader, opts engine.IngestOptions) (int64, error) {
+	return g.Engine.IngestStream(ctx, table, &gatedRecordReader{
+		src:         reader,
+		blockBefore: g.blockBefore,
+		blocked:     g.blocked,
+		release:     g.release,
+	}, opts)
+}
+
+type gatedRecordReader struct {
+	src         array.RecordReader
+	index       int
+	blockBefore int
+	blocked     chan struct{}
+	release     chan struct{}
+	blockOnce   sync.Once
+}
+
+func (r *gatedRecordReader) Retain()  {}
+func (r *gatedRecordReader) Release() {}
+func (r *gatedRecordReader) Schema() *arrow.Schema {
+	return r.src.Schema()
+}
+func (r *gatedRecordReader) Next() bool {
+	if r.index == r.blockBefore {
+		r.blockOnce.Do(func() { close(r.blocked) })
+		<-r.release
+	}
+	if !r.src.Next() {
+		return false
+	}
+	r.index++
+	return true
+}
+func (r *gatedRecordReader) RecordBatch() arrow.RecordBatch { return r.src.RecordBatch() }
+func (r *gatedRecordReader) Record() arrow.RecordBatch      { return r.RecordBatch() }
+func (r *gatedRecordReader) Err() error                     { return r.src.Err() }
+
+func makeInt64Batch(t *testing.T, alloc memory.Allocator, values []int64) arrow.RecordBatch {
+	t.Helper()
+	schema := arrow.NewSchema([]arrow.Field{{Name: "id", Type: arrow.PrimitiveTypes.Int64, Nullable: true}}, nil)
+	builder := array.NewRecordBuilder(alloc, schema)
+	defer builder.Release()
+	builder.Field(0).(*array.Int64Builder).AppendValues(values, nil)
+	rec := builder.NewRecordBatch()
+	if rec == nil {
+		t.Fatal("failed to build int64 record batch")
+	}
+	return rec
+}
+
+func newIntegrationEngine(t *testing.T) engine.Engine {
+	t.Helper()
+	manager, err := adbc.NewManager()
+	if err != nil {
+		t.Fatalf("create adbc manager: %v", err)
+	}
+	eng, err := engine.New(engine.Config{
+		DBPath:      ":memory:",
+		ADBCManager: manager,
+		DevMode:     true,
+		Logger:      slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
+	if err != nil {
+		t.Skipf("skipping integration test because engine cannot be created: %v", err)
+	}
+	return eng
+}
+
+func countRowsFromEngine(t *testing.T, eng engine.Engine, sql string) int64 {
+	t.Helper()
+	_, ch, err := eng.BuildStream(context.Background(), sql, nil)
+	if err != nil {
+		t.Fatalf("BuildStream failed: %v", err)
+	}
+
+	var total int64
+	for chunk := range ch {
+		if chunk.Err != nil {
+			t.Fatalf("stream failed: %v", chunk.Err)
+		}
+		if chunk.Data != nil {
+			total += chunk.Data.NumRows()
+			chunk.Data.Release()
+		}
+	}
+	return total
+}
+
+func TestFlightSQLDoPutStatementIngestStreamingCommitAndRollback(t *testing.T) {
+	baseEngine := newIntegrationEngine(t)
+	eng := &gatedEngine{
+		Engine:      baseEngine,
+		blockBefore: 2,
+		blocked:     make(chan struct{}),
+		release:     make(chan struct{}),
+	}
+
+	srv, err := NewServer(Config{
+		Engine: eng,
+		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
+	if err != nil {
+		t.Fatalf("new server: %v", err)
+	}
+	defer srv.Close()
+
+	listener := bufconn.Listen(1 << 20)
+	grpcServer := grpc.NewServer()
+	flight.RegisterFlightServiceServer(grpcServer, srv.AsFlightServer())
+	defer grpcServer.Stop()
+	go func() {
+		_ = grpcServer.Serve(listener)
+	}()
+
+	client, err := fsql.NewClient(
+		"passthrough:///bufnet",
+		nil,
+		nil,
+		grpc.WithContextDialer(func(context.Context, string) (net.Conn, error) {
+			return listener.Dial()
+		}),
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+	)
+	if err != nil {
+		t.Fatalf("new flightsql client: %v", err)
+	}
+	defer client.Close()
+
+	if _, err := eng.ExecuteUpdate(context.Background(), "CREATE TABLE ingest_target(id BIGINT)"); err != nil {
+		t.Fatalf("create table: %v", err)
+	}
+
+	checked, ok := baseEngine.Allocator().(*memory.CheckedAllocator)
+	if !ok {
+		t.Fatal("expected checked allocator in dev mode")
+	}
+	baseline := checked.CurrentAlloc()
+
+	clientAlloc := memory.NewGoAllocator()
+	batch1 := makeInt64Batch(t, clientAlloc, []int64{1, 2})
+	defer batch1.Release()
+	batch2 := makeInt64Batch(t, clientAlloc, []int64{3, 4})
+	defer batch2.Release()
+	batch3 := makeInt64Batch(t, clientAlloc, []int64{5, 6})
+	defer batch3.Release()
+
+	successReader, err := array.NewRecordReader(batch1.Schema(), []arrow.RecordBatch{batch1, batch2, batch3})
+	if err != nil {
+		t.Fatalf("new success record reader: %v", err)
+	}
+	defer successReader.Release()
+
+	type ingestResult struct {
+		rows int64
+		err  error
+	}
+	successDone := make(chan ingestResult, 1)
+	go func() {
+		rows, err := client.ExecuteIngest(context.Background(), successReader, &fsql.ExecuteIngestOpts{
+			TableDefinitionOptions: &fsql.TableDefinitionOptions{
+				IfNotExist: fsql.TableDefinitionOptionsTableNotExistOptionFail,
+				IfExists:   fsql.TableDefinitionOptionsTableExistsOptionAppend,
+			},
+			Table: "ingest_target",
+		})
+		successDone <- ingestResult{rows: rows, err: err}
+	}()
+
+	select {
+	case <-eng.blocked:
+	case result := <-successDone:
+		t.Fatalf("ingest returned before streaming checkpoint: rows=%d err=%v", result.rows, result.err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for engine ingest stream to block")
+	}
+
+	if got := countRowsFromEngine(t, eng, "SELECT * FROM ingest_target"); got != 0 {
+		t.Fatalf("expected no partial visibility before commit, got %d rows", got)
+	}
+
+	close(eng.release)
+
+	success := <-successDone
+	if success.err != nil {
+		t.Fatalf("successful ingest failed: %v", success.err)
+	}
+	if success.rows != 6 {
+		t.Fatalf("expected 6 ingested rows, got %d", success.rows)
+	}
+	if got := countRowsFromEngine(t, eng, "SELECT * FROM ingest_target"); got != 6 {
+		t.Fatalf("expected 6 rows after commit, got %d", got)
+	}
+
+	failBatch1 := makeInt64Batch(t, clientAlloc, []int64{7, 8})
+	defer failBatch1.Release()
+	failBatch2 := makeInt64Batch(t, clientAlloc, []int64{9, 10})
+	defer failBatch2.Release()
+	failBatch3 := makeInt64Batch(t, clientAlloc, []int64{11, 12})
+	defer failBatch3.Release()
+
+	failReader, err := array.NewRecordReader(failBatch1.Schema(), []arrow.RecordBatch{failBatch1, failBatch2, failBatch3})
+	if err != nil {
+		t.Fatalf("new failing record reader: %v", err)
+	}
+	defer failReader.Release()
+
+	failedRows, err := client.ExecuteIngest(context.Background(), failReader, &fsql.ExecuteIngestOpts{
+		TableDefinitionOptions: &fsql.TableDefinitionOptions{
+			IfNotExist: fsql.TableDefinitionOptionsTableNotExistOptionFail,
+			IfExists:   fsql.TableDefinitionOptionsTableExistsOptionAppend,
+		},
+		Table: "ingest_target",
+		Options: map[string]string{
+			maxUncommittedBytesOption: "1",
+		},
+	})
+	if err == nil {
+		t.Fatal("expected bounded-memory ingest failure")
+	}
+	if status.Code(err) != codes.ResourceExhausted {
+		t.Fatalf("expected ResourceExhausted, got %v", err)
+	}
+	if failedRows != 0 {
+		t.Fatalf("expected failed ingest to report 0 committed rows, got %d", failedRows)
+	}
+	if got := countRowsFromEngine(t, eng, "SELECT * FROM ingest_target"); got != 6 {
+		t.Fatalf("expected rollback to preserve committed rows only, got %d", got)
+	}
+
+	checked.AssertSize(t, baseline)
 }
 
 func TestDoGetPreparedStatementConcurrentReaders(t *testing.T) {

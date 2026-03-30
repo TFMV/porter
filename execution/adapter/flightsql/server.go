@@ -7,10 +7,12 @@ import (
 	"encoding/hex"
 	"io"
 	"log/slog"
+	"strconv"
 	"sync"
 	"time"
 
 	"github.com/TFMV/porter/execution/engine"
+	adbc_driver "github.com/apache/arrow-adbc/go/adbc"
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/flight"
 	fsql "github.com/apache/arrow-go/v18/arrow/flight/flightsql"
@@ -28,6 +30,7 @@ const (
 	defaultHandleTTL          = 30 * time.Minute
 	defaultGCInterval         = 5 * time.Minute
 	defaultSchemaProbeTimeout = 5 * time.Second
+	maxUncommittedBytesOption = "porter.ingest.max_uncommitted_bytes"
 )
 
 // ─── ERROR TAXONOMY ───────────────────────────────────────────────────────────
@@ -259,6 +262,142 @@ func (s *Server) buildStream(
 	params arrow.RecordBatch,
 ) (*arrow.Schema, <-chan flight.StreamChunk, error) {
 	return s.Engine.BuildStream(ctx, sql, params)
+}
+
+// ingestStreamReader adapts the Flight DoPut stream to the engine's Arrow
+// RecordReader contract without taking ownership of the underlying stream.
+//
+// Ownership rules:
+//   - The caller owns the incoming Flight MessageReader and is responsible for
+//     releasing it.
+//   - The adapter never buffers the full dataset; it forwards RecordBatches as
+//     the engine pulls them.
+//   - The engine may retain individual batches during ingestion, but the
+//     adapter itself does not retain or release them.
+type ingestStreamReader struct {
+	src         flight.MessageReader
+	firstSchema *arrow.Schema
+	err         error
+}
+
+func newIngestStreamReader(src flight.MessageReader) (*ingestStreamReader, error) {
+	if src == nil {
+		return nil, status.Error(codes.InvalidArgument, "ingest stream reader is required")
+	}
+
+	return &ingestStreamReader{
+		src:         src,
+		firstSchema: src.Schema(),
+	}, nil
+}
+
+func (r *ingestStreamReader) Retain() {}
+
+func (r *ingestStreamReader) Release() {}
+
+func (r *ingestStreamReader) Schema() *arrow.Schema {
+	if r.firstSchema != nil {
+		return r.firstSchema
+	}
+	return r.src.Schema()
+}
+
+func (r *ingestStreamReader) Next() bool {
+	if !r.src.Next() {
+		return false
+	}
+
+	rec := r.src.RecordBatch()
+	if rec == nil {
+		return true
+	}
+
+	if r.firstSchema == nil {
+		r.firstSchema = rec.Schema()
+		return true
+	}
+
+	if !rec.Schema().Equal(r.firstSchema) {
+		r.err = status.Error(codes.InvalidArgument, "ingest stream schema changed mid-stream")
+		return false
+	}
+
+	return true
+}
+
+func (r *ingestStreamReader) RecordBatch() arrow.RecordBatch {
+	if r.err != nil {
+		return nil
+	}
+	return r.src.RecordBatch()
+}
+
+func (r *ingestStreamReader) Record() arrow.RecordBatch {
+	return r.RecordBatch()
+}
+
+func (r *ingestStreamReader) Err() error {
+	if r.err != nil {
+		return r.err
+	}
+	return r.src.Err()
+}
+
+func ingestModeForCommand(cmd fsql.StatementIngest) string {
+	opts := cmd.GetTableDefinitionOptions()
+	if opts == nil {
+		return adbc_driver.OptionValueIngestModeAppend
+	}
+
+	switch opts.IfExists {
+	case fsql.TableDefinitionOptionsTableExistsOptionReplace:
+		return adbc_driver.OptionValueIngestModeReplace
+	case fsql.TableDefinitionOptionsTableExistsOptionAppend:
+		if opts.IfNotExist == fsql.TableDefinitionOptionsTableNotExistOptionCreate {
+			return adbc_driver.OptionValueIngestModeCreateAppend
+		}
+		return adbc_driver.OptionValueIngestModeAppend
+	case fsql.TableDefinitionOptionsTableExistsOptionFail:
+		if opts.IfNotExist == fsql.TableDefinitionOptionsTableNotExistOptionCreate {
+			return adbc_driver.OptionValueIngestModeCreate
+		}
+	}
+
+	if opts.IfNotExist == fsql.TableDefinitionOptionsTableNotExistOptionCreate {
+		return adbc_driver.OptionValueIngestModeCreateAppend
+	}
+
+	return adbc_driver.OptionValueIngestModeAppend
+}
+
+func buildIngestOptions(cmd fsql.StatementIngest) (engine.IngestOptions, error) {
+	extra := make(map[string]string, len(cmd.GetOptions()))
+	for key, val := range cmd.GetOptions() {
+		extra[key] = val
+	}
+
+	var maxBytes int64
+	if raw, ok := extra[maxUncommittedBytesOption]; ok && raw != "" {
+		parsed, err := strconv.ParseInt(raw, 10, 64)
+		if err != nil {
+			return engine.IngestOptions{}, status.Errorf(codes.InvalidArgument, "%s must be a valid int64", maxUncommittedBytesOption)
+		}
+		if parsed <= 0 {
+			return engine.IngestOptions{}, status.Errorf(codes.InvalidArgument, "%s must be greater than zero", maxUncommittedBytesOption)
+		}
+		maxBytes = parsed
+		delete(extra, maxUncommittedBytesOption)
+	}
+
+	return engine.IngestOptions{
+		Catalog:             cmd.GetCatalog(),
+		DBSchema:            cmd.GetSchema(),
+		Temporary:           cmd.GetTemporary(),
+		TransactionID:       append([]byte(nil), cmd.GetTransactionId()...),
+		IngestMode:          ingestModeForCommand(cmd),
+		ExtraOptions:        extra,
+		MaxUncommittedBytes: maxBytes,
+	}, nil
 }
 
 // ─── FLIGHTSQL STATEMENT ROUTING ──────────────────────────────────────────────
@@ -532,6 +671,32 @@ func (s *Server) DoPutCommandStatementUpdate(
 	}
 
 	return s.Engine.ExecuteUpdate(ctx, sql)
+}
+
+func (s *Server) DoPutCommandStatementIngest(
+	ctx context.Context,
+	cmd fsql.StatementIngest,
+	reader flight.MessageReader,
+) (int64, error) {
+	table := cmd.GetTable()
+	if table == "" {
+		return 0, status.Error(codes.InvalidArgument, "ingest table is required")
+	}
+	if reader == nil {
+		return 0, status.Error(codes.InvalidArgument, "ingest stream reader is required")
+	}
+
+	streamReader, err := newIngestStreamReader(reader)
+	if err != nil {
+		return 0, err
+	}
+
+	ingestOpts, err := buildIngestOptions(cmd)
+	if err != nil {
+		return 0, err
+	}
+
+	return s.Engine.IngestStream(ctx, table, streamReader, ingestOpts)
 }
 
 // ─── DOEXCHANGE (ZERO-COPY DIRECT STREAMING) ──────────────────────────────────
