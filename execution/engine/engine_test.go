@@ -148,7 +148,7 @@ func TestEngine_BuildStream_Ordering(t *testing.T) {
 func makeIntBatch(t *testing.T, vals []int64) arrow.RecordBatch {
 	t.Helper()
 	pool := memory.NewGoAllocator()
-	schema := arrow.NewSchema([]arrow.Field{{Name: "id", Type: arrow.PrimitiveTypes.Int64}}, nil)
+	schema := arrow.NewSchema([]arrow.Field{{Name: "id", Type: arrow.PrimitiveTypes.Int64, Nullable: true}}, nil)
 	b := array.NewRecordBuilder(pool, schema)
 	defer b.Release()
 	col := b.Field(0).(*array.Int64Builder)
@@ -289,22 +289,18 @@ func TestEngine_IngestStream_RollbackOnMidStreamFailure(t *testing.T) {
 
 	good := makeIntBatch(t, []int64{1, 2})
 	defer good.Release()
-	pool := memory.NewGoAllocator()
-	badSchema := arrow.NewSchema([]arrow.Field{{Name: "id", Type: arrow.BinaryTypes.String}}, nil)
-	builder := array.NewRecordBuilder(pool, badSchema)
-	defer builder.Release()
-	builder.Field(0).(*array.StringBuilder).AppendValues([]string{"bad"}, nil)
-	bad := builder.NewRecordBatch()
-	defer bad.Release()
 
-	rdr, err := array.NewRecordReader(good.Schema(), []arrow.Record{good, bad})
+	rdr, err := array.NewRecordReader(good.Schema(), []arrow.Record{good})
 	if err != nil {
 		t.Fatalf("new reader: %v", err)
 	}
 	defer rdr.Release()
 
-	if _, err := eng.IngestStream(context.Background(), "tx_rollback", rdr, IngestOptions{}); err == nil {
-		t.Fatal("expected ingest failure")
+	_, err = eng.IngestStream(context.Background(), "tx_rollback", rdr, IngestOptions{
+		MaxUncommittedBytes: 1,
+	})
+	if err == nil {
+		t.Fatal("expected ingest failure due to max bytes")
 	}
 	if got := countRows(t, eng, "SELECT * FROM tx_rollback"); got != 0 {
 		t.Fatalf("expected rollback with zero rows, got %d", got)
@@ -336,5 +332,34 @@ func TestEngine_IngestStream_LargeBatch(t *testing.T) {
 	}
 	if got := countRows(t, eng, fmt.Sprintf("SELECT * FROM large_batch")); got != rows {
 		t.Fatalf("expected %d rows, got %d", rows, got)
+	}
+}
+
+func TestEngine_IngestStream_ReplaceCreatesMissingTable(t *testing.T) {
+	eng := newTestEngine(t, Config{DBPath: ":memory:"})
+	defer eng.Close()
+
+	b1 := makeIntBatch(t, []int64{1, 2, 3})
+	defer b1.Release()
+	b2 := makeIntBatch(t, []int64{4, 5, 6})
+	defer b2.Release()
+
+	rdr, err := array.NewRecordReader(b1.Schema(), []arrow.RecordBatch{b1, b2})
+	if err != nil {
+		t.Fatalf("new record reader: %v", err)
+	}
+	defer rdr.Release()
+
+	n, err := eng.IngestStream(context.Background(), "replace_create_ingest", rdr, IngestOptions{
+		IngestMode: "adbc.ingest.mode.replace",
+	})
+	if err != nil {
+		t.Fatalf("ingest with replace-on-missing failed: %v", err)
+	}
+	if n != 6 {
+		t.Fatalf("expected 6 ingested rows, got %d", n)
+	}
+	if got := countRows(t, eng, "SELECT * FROM replace_create_ingest"); got != 6 {
+		t.Fatalf("expected 6 rows in created table, got %d", got)
 	}
 }

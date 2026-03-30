@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -37,6 +38,16 @@ func wrapInternal(err error, msg string) error {
 		return nil
 	}
 	return status.Errorf(codes.Internal, "%s: %v", msg, err)
+}
+
+func wrapPreservingCode(err error, msg string) error {
+	if err == nil {
+		return nil
+	}
+	if st, ok := status.FromError(err); ok {
+		return status.Errorf(st.Code(), "%s: %v", msg, err)
+	}
+	return wrapInternal(err, msg)
 }
 
 func isInvalidArgument(err error) bool {
@@ -84,10 +95,12 @@ type engine struct {
 }
 
 type IngestOptions struct {
-	Catalog      string
-	DBSchema     string
-	Temporary    bool
-	ExtraOptions map[string]string
+	Catalog       string
+	DBSchema      string
+	Temporary     bool
+	TransactionID []byte
+	IngestMode    string
+	ExtraOptions  map[string]string
 	// MaxUncommittedBytes bounds in-memory uncommitted segment storage.
 	// Zero uses a safe default.
 	MaxUncommittedBytes int64
@@ -464,11 +477,6 @@ func (e *engine) IngestStream(ctx context.Context, table string, reader array.Re
 		defer connOpts.SetOption(adbc_driver.OptionKeyAutoCommit, adbc_driver.OptionValueEnabled)
 	}
 
-	targetSchema, err := conn.GetTableSchema(ctx, nil, nil, table)
-	if err != nil {
-		return 0, status.Errorf(codes.InvalidArgument, "resolve destination table schema: %v", err)
-	}
-
 	var firstBatch arrow.RecordBatch
 	for reader.Next() {
 		firstBatch = reader.RecordBatch()
@@ -489,6 +497,11 @@ func (e *engine) IngestStream(ctx context.Context, table string, reader array.Re
 	}
 
 	sessionSchema := firstBatch.Schema()
+	targetSchema, err := resolveIngestTargetSchema(ctx, conn, table, sessionSchema, opts)
+	if err != nil {
+		_ = conn.Rollback(ctx)
+		return 0, err
+	}
 	if !sessionSchema.Equal(targetSchema) {
 		_ = conn.Rollback(ctx)
 		return 0, status.Errorf(codes.InvalidArgument, "ingest schema mismatch for table %q", table)
@@ -510,24 +523,24 @@ func (e *engine) IngestStream(ctx context.Context, table string, reader array.Re
 
 	if err := appendBatch(firstBatch); err != nil {
 		_ = conn.Rollback(ctx)
-		return 0, wrapInternal(err, "append first segment")
+		return 0, wrapPreservingCode(err, "append first segment")
 	}
 
 	for reader.Next() {
 		if err := appendBatch(reader.RecordBatch()); err != nil {
 			_ = conn.Rollback(ctx)
-			return 0, wrapInternal(err, "append ingest segment")
+			return 0, wrapPreservingCode(err, "append ingest segment")
 		}
 	}
 	if err := reader.Err(); err != nil {
 		_ = conn.Rollback(ctx)
-		return 0, wrapInternal(err, "read ingest stream")
+		return 0, wrapPreservingCode(err, "read ingest stream")
 	}
 
 	ingested, err := writer.Commit(ctx, conn)
 	if err != nil {
 		_ = conn.Rollback(ctx)
-		return 0, wrapInternal(err, "publish ingest segments")
+		return 0, wrapPreservingCode(err, "publish ingest segments")
 	}
 	if err := conn.Commit(ctx); err != nil {
 		_ = conn.Rollback(ctx)
@@ -600,8 +613,8 @@ func (w *segmentWriter) Append(batch arrow.RecordBatch) error {
 // visibility with the surrounding transaction commit.
 func (w *segmentWriter) Commit(ctx context.Context, conn adbc_driver.Connection) (int64, error) {
 	var totalRows int64
-	for _, seg := range w.segments {
-		n, err := ingestBatchToTable(ctx, conn, w.table, seg.batch, w.opts)
+	for i, seg := range w.segments {
+		n, err := ingestBatchToTable(ctx, conn, w.table, seg.batch, w.segmentOptions(i))
 		if err != nil {
 			return 0, err
 		}
@@ -614,12 +627,82 @@ func (w *segmentWriter) Commit(ctx context.Context, conn adbc_driver.Connection)
 	return totalRows, nil
 }
 
+func (w *segmentWriter) segmentOptions(index int) IngestOptions {
+	if index == 0 {
+		return w.opts
+	}
+
+	switch ingestMode(w.opts) {
+	case adbc_driver.OptionValueIngestModeCreate,
+		adbc_driver.OptionValueIngestModeCreateAppend,
+		adbc_driver.OptionValueIngestModeReplace:
+		next := w.opts
+		next.IngestMode = adbc_driver.OptionValueIngestModeAppend
+		return next
+	default:
+		return w.opts
+	}
+}
+
 func (w *segmentWriter) Release() {
 	for _, seg := range w.segments {
 		seg.Release()
 	}
 	w.segments = nil
 	w.pendingBytes = 0
+}
+
+func ingestMode(opts IngestOptions) string {
+	if opts.IngestMode != "" {
+		return opts.IngestMode
+	}
+	return adbc_driver.OptionValueIngestModeAppend
+}
+
+func resolveIngestTargetSchema(
+	ctx context.Context,
+	conn adbc_driver.Connection,
+	table string,
+	sessionSchema *arrow.Schema,
+	opts IngestOptions,
+) (*arrow.Schema, error) {
+	mode := ingestMode(opts)
+	targetSchema, err := conn.GetTableSchema(ctx, nil, nil, table)
+	if err == nil {
+		if mode == adbc_driver.OptionValueIngestModeReplace {
+			return sessionSchema, nil
+		}
+		return targetSchema, nil
+	}
+
+	if ingestMissingTableAllowed(err, mode) {
+		return sessionSchema, nil
+	}
+
+	return nil, status.Errorf(codes.InvalidArgument, "resolve destination table schema: %v", err)
+}
+
+func ingestMissingTableAllowed(err error, mode string) bool {
+	var adbcErr adbc_driver.Error
+	if errors.As(err, &adbcErr) && adbcErr.Code == adbc_driver.StatusNotFound {
+		switch mode {
+		case adbc_driver.OptionValueIngestModeCreate,
+			adbc_driver.OptionValueIngestModeCreateAppend,
+			adbc_driver.OptionValueIngestModeReplace:
+			return true
+		}
+	}
+
+	if mode != adbc_driver.OptionValueIngestModeCreate &&
+		mode != adbc_driver.OptionValueIngestModeCreateAppend &&
+		mode != adbc_driver.OptionValueIngestModeReplace {
+		return false
+	}
+
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "does not exist") ||
+		strings.Contains(msg, "not found") ||
+		(strings.Contains(msg, "catalog error") && strings.Contains(msg, "table with name"))
 }
 
 func ingestBatchToTable(ctx context.Context, conn adbc_driver.Connection, table string, batch arrow.RecordBatch, opts IngestOptions) (int64, error) {
@@ -635,7 +718,7 @@ func ingestBatchToTable(ctx context.Context, conn adbc_driver.Connection, table 
 	if err := stmt.SetOption(adbc_driver.OptionKeyIngestTargetTable, table); err != nil {
 		return 0, err
 	}
-	if err := stmt.SetOption(adbc_driver.OptionKeyIngestMode, adbc_driver.OptionValueIngestModeAppend); err != nil {
+	if err := stmt.SetOption(adbc_driver.OptionKeyIngestMode, ingestMode(opts)); err != nil {
 		return 0, err
 	}
 	if opts.Catalog != "" {
