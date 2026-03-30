@@ -239,6 +239,8 @@ The flow view tracks:
 * live structured activity feed
 * WebSocket vs FlightSQL vs ingest path comparison
 
+![Porter Status](assets/porter-status.png)
+
 ---
 
 ## 🌐 Wire Contract
@@ -334,12 +336,6 @@ Backpressure is enforced naturally via the channel boundary.
 - [ ] Session context
 - [ ] Improved schema probing
 - [ ] Benchmark suite
-
----
-
-Porter includes a system status page.
-
-![Porter Status](assets/porter-status.png)
 
 ---
 
