@@ -19,6 +19,23 @@ Both transports share the same execution engine, ensuring identical query semant
 
 ---
 
+## Summary Benchmark Results
+
+| Metric      | WebSocket    | FlightSQL (gRPC) |
+| ----------- | ------------ | ---------------- |
+| Ops         | 12           | 12               |
+| Success     | 12           | 12               |
+| Errors      | 0            | 0                |
+| Rows/sec    | 130,712,427  | 121,704,008      |
+| Throughput  | 1014.32 MB/s | 928.53 MB/s      |
+| Latency p50 | 26 ms        | 17 ms            |
+| Latency p95 | 41 ms        | 60 ms            |
+| Latency p99 | 41 ms        | 60 ms            |
+
+See the [Benchmark Report](bench/bench_results.md) for details.
+
+---
+
 ## ⚡ Key Characteristics
 
 * Streaming-first execution model (Arrow RecordBatch streams)
