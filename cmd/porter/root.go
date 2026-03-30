@@ -37,6 +37,8 @@ func init() {
 	rootCmd.PersistentFlags().Int("ws-port", 8080, "WebSocket server port")
 	rootCmd.PersistentFlags().Bool("status", true, "Enable live status endpoint")
 	rootCmd.PersistentFlags().Int("status-port", 9091, "Status server port")
+	rootCmd.PersistentFlags().Bool("ducklake", false, "Enable DuckLake at server startup")
+	rootCmd.PersistentFlags().String("ducklake-path", "metadata.ducklake", "DuckLake metadata path")
 
 	if err := viper.BindPFlag("db", rootCmd.PersistentFlags().Lookup("db")); err != nil {
 		fmt.Fprintln(os.Stderr, err)
@@ -62,12 +64,22 @@ func init() {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
+	if err := viper.BindPFlag("ducklake", rootCmd.PersistentFlags().Lookup("ducklake")); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	if err := viper.BindPFlag("ducklake-path", rootCmd.PersistentFlags().Lookup("ducklake-path")); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
 	viper.SetDefault("db", ":memory:")
 	viper.SetDefault("port", 32010)
 	viper.SetDefault("ws", false)
 	viper.SetDefault("ws-port", 8080)
 	viper.SetDefault("status", true)
 	viper.SetDefault("status-port", 9091)
+	viper.SetDefault("ducklake", false)
+	viper.SetDefault("ducklake-path", "metadata.ducklake")
 
 	viper.SetEnvPrefix("PORTER")
 	viper.AutomaticEnv()
@@ -93,6 +105,14 @@ func init() {
 		os.Exit(1)
 	}
 	if err := viper.BindEnv("status-port"); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	if err := viper.BindEnv("ducklake"); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	if err := viper.BindEnv("ducklake-path"); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}

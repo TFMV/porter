@@ -68,6 +68,8 @@ type Config struct {
 	DevMode              bool
 	ADBCManager          *adbc.Manager
 	Telemetry            telemetry.Publisher
+	StartupSQL           []string
+	ConnectionInitSQL    []string
 }
 
 type Engine interface {
@@ -88,13 +90,14 @@ type engine struct {
 	schemaProbeTimeout time.Duration
 	querySemaphore     chan struct{}
 
-	activeOps       sync.WaitGroup
-	activeQueries   map[int64]context.CancelFunc
-	activeQueriesMu sync.Mutex
-	nextQueryID     int64
-	closeOnce       sync.Once
-	tableLocks      sync.Map
-	telemetry       telemetry.Publisher
+	activeOps         sync.WaitGroup
+	activeQueries     map[int64]context.CancelFunc
+	activeQueriesMu   sync.Mutex
+	nextQueryID       int64
+	closeOnce         sync.Once
+	tableLocks        sync.Map
+	telemetry         telemetry.Publisher
+	connectionInitSQL []string
 }
 
 type IngestOptions struct {
@@ -155,6 +158,27 @@ func New(cfg Config) (Engine, error) {
 		return nil, fmt.Errorf("open duckdb %q: %w", dbPath, err)
 	}
 
+	if len(cfg.StartupSQL) > 0 {
+		initCtx, cancel := context.WithTimeout(context.Background(), time.Minute)
+		defer cancel()
+
+		conn, err := db.Open(initCtx)
+		if err != nil {
+			db.Close()
+			return nil, fmt.Errorf("open database for startup initialization: %w", err)
+		}
+
+		if err := runStartupSQL(initCtx, conn, cfg.StartupSQL); err != nil {
+			conn.Close()
+			db.Close()
+			return nil, fmt.Errorf("run startup SQL: %w", err)
+		}
+		if err := conn.Close(); err != nil {
+			db.Close()
+			return nil, fmt.Errorf("close startup initialization connection: %w", err)
+		}
+	}
+
 	var alloc memory.Allocator = memory.NewGoAllocator()
 	if cfg.DevMode {
 		alloc = memory.NewCheckedAllocator(memory.NewGoAllocator())
@@ -172,6 +196,7 @@ func New(cfg Config) (Engine, error) {
 		schemaProbeTimeout: schemaProbeTimeout,
 		activeQueries:      make(map[int64]context.CancelFunc),
 		telemetry:          cfg.Telemetry,
+		connectionInitSQL:  append([]string(nil), cfg.ConnectionInitSQL...),
 	}
 
 	if cfg.MaxConcurrentQueries > 0 {
@@ -183,6 +208,50 @@ func New(cfg Config) (Engine, error) {
 
 func (e *engine) Allocator() memory.Allocator {
 	return e.Alloc
+}
+
+func runStartupSQL(ctx context.Context, conn adbc_driver.Connection, statements []string) error {
+	for _, statement := range statements {
+		sql := strings.TrimSpace(statement)
+		if sql == "" {
+			continue
+		}
+
+		stmt, err := conn.NewStatement()
+		if err != nil {
+			return fmt.Errorf("create startup statement for %q: %w", sql, err)
+		}
+
+		if err := stmt.SetSqlQuery(sql); err != nil {
+			stmt.Close()
+			return fmt.Errorf("set startup SQL %q: %w", sql, err)
+		}
+
+		if _, err := stmt.ExecuteUpdate(ctx); err != nil {
+			stmt.Close()
+			return fmt.Errorf("execute startup SQL %q: %w", sql, err)
+		}
+
+		if err := stmt.Close(); err != nil {
+			return fmt.Errorf("close startup statement for %q: %w", sql, err)
+		}
+	}
+	return nil
+}
+
+func (e *engine) openConnection(ctx context.Context) (adbc_driver.Connection, error) {
+	conn, err := e.db.Open(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if len(e.connectionInitSQL) == 0 {
+		return conn, nil
+	}
+	if err := runStartupSQL(ctx, conn, e.connectionInitSQL); err != nil {
+		conn.Close()
+		return nil, err
+	}
+	return conn, nil
 }
 
 func (e *engine) publish(ctx context.Context, evt telemetry.Event) {
@@ -280,7 +349,7 @@ func (e *engine) DeriveSchema(ctx context.Context, sql string) (*arrow.Schema, e
 	probeCtx, cancel := context.WithTimeout(ctx, e.schemaProbeTimeout)
 	defer cancel()
 
-	conn, err := e.db.Open(probeCtx)
+	conn, err := e.openConnection(probeCtx)
 	if err != nil {
 		return nil, wrapInternal(err, "failed to open adbc connection")
 	}
@@ -368,7 +437,7 @@ func (e *engine) BuildStream(
 		e.Logger.Debug("query slot acquired before execution", slog.String("sql", sql), slog.Bool("hasParams", params != nil))
 	}
 
-	conn, err := e.db.Open(ctx)
+	conn, err := e.openConnection(ctx)
 	if err != nil {
 		e.publish(ctx, telemetry.Event{
 			Component: telemetry.ComponentExecution,
@@ -515,7 +584,7 @@ func (e *engine) ExecuteUpdate(ctx context.Context, sql string) (int64, error) {
 	}
 	defer e.ReleaseQuerySlot()
 
-	conn, err := e.db.Open(ctx)
+	conn, err := e.openConnection(ctx)
 	if err != nil {
 		e.publish(ctx, telemetry.Event{
 			Component: telemetry.ComponentExecution,
@@ -652,7 +721,7 @@ func (e *engine) IngestStream(ctx context.Context, table string, reader array.Re
 	unlock := e.lockForTable(table)
 	defer unlock()
 
-	conn, err := e.db.Open(ctx)
+	conn, err := e.openConnection(ctx)
 	if err != nil {
 		e.publish(ctx, telemetry.Event{
 			Component: telemetry.ComponentExecution,
