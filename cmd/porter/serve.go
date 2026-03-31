@@ -14,6 +14,7 @@ import (
 	ws "github.com/TFMV/porter/execution/adapter/ws"
 	"github.com/TFMV/porter/execution/engine"
 	"github.com/TFMV/porter/internal/adbc"
+	internalducklake "github.com/TFMV/porter/internal/ducklake"
 	"github.com/TFMV/porter/telemetry"
 	"github.com/apache/arrow-go/v18/arrow/flight"
 	"github.com/spf13/cobra"
@@ -21,14 +22,17 @@ import (
 )
 
 var (
-	dbPath       string
-	port         int
-	wsEnable     bool
-	wsPort       int
-	statusEnable bool
-	statusPort   int
-	duckLake     bool
-	duckLakePath string
+	dbPath              string
+	port                int
+	wsEnable            bool
+	wsPort              int
+	statusEnable        bool
+	statusPort          int
+	duckLake            bool
+	duckLakeCatalogType string
+	duckLakeCatalogDSN  string
+	duckLakeDataPath    string
+	duckLakeName        string
 )
 
 var serveCmd = &cobra.Command{
@@ -44,8 +48,13 @@ var serveCmd = &cobra.Command{
 			WsPort:       wsPort,
 			StatusEnable: statusEnable,
 			StatusPort:   statusPort,
-			DuckLake:     duckLake,
-			DuckLakePath: duckLakePath,
+			DuckLake: internalducklake.Config{
+				Enabled:     duckLake,
+				CatalogType: duckLakeCatalogType,
+				CatalogDSN:  duckLakeCatalogDSN,
+				DataPath:    duckLakeDataPath,
+				Name:        duckLakeName,
+			}.Normalize(),
 		}
 		return runServe(cfg)
 	},
@@ -59,37 +68,39 @@ func init() {
 	serveCmd.Flags().BoolVar(&statusEnable, "status", true, "Enable status endpoint")
 	serveCmd.Flags().IntVar(&statusPort, "status-port", 9091, "Port to run status server on")
 	serveCmd.Flags().BoolVar(&duckLake, "ducklake", false, "Enable DuckLake at server startup")
-	serveCmd.Flags().StringVar(&duckLakePath, "ducklake-path", "metadata.ducklake", "DuckLake metadata path")
+	serveCmd.Flags().StringVar(&duckLakeCatalogType, "ducklake-catalog-type", "duckdb", "DuckLake catalog type: duckdb, sqlite, postgres, mysql")
+	serveCmd.Flags().StringVar(&duckLakeCatalogDSN, "ducklake-catalog-dsn", "metadata.ducklake", "DuckLake catalog DSN or file path")
+	serveCmd.Flags().StringVar(&duckLakeDataPath, "ducklake-data-path", "", "DuckLake data path for Parquet/object storage")
+	serveCmd.Flags().StringVar(&duckLakeName, "ducklake-name", "my_ducklake", "Attached DuckLake catalog name")
 }
 
-func duckLakeInitStatements(path string) []string {
-	return []string{
-		"INSTALL ducklake;",
-		"LOAD ducklake;",
-		fmt.Sprintf("ATTACH 'ducklake:%s' AS my_ducklake;", quoteSQLString(path)),
-		"USE my_ducklake;",
-	}
-}
-
-func buildEngineConfig(cfg porterConfig, adbcManager *adbc.Manager, publisher telemetry.Publisher) engine.Config {
+func buildEngineConfig(cfg porterConfig, adbcManager *adbc.Manager, publisher telemetry.Publisher) (engine.Config, error) {
 	engineCfg := engine.Config{
 		DBPath:      cfg.DBPath,
 		ADBCManager: adbcManager,
 		Telemetry:   publisher,
 	}
-	if cfg.DuckLake {
-		statements := duckLakeInitStatements(cfg.DuckLakePath)
-		engineCfg.StartupSQL = statements
-		engineCfg.ConnectionInitSQL = []string{
-			"LOAD ducklake;",
-			"USE my_ducklake;",
+	if cfg.DuckLake.Enabled {
+		statements, err := cfg.DuckLake.StartupSQL()
+		if err != nil {
+			return engineCfg, err
 		}
+		connectionSQL, err := cfg.DuckLake.ConnectionInitSQL()
+		if err != nil {
+			return engineCfg, err
+		}
+		engineCfg.StartupSQL = statements
+		engineCfg.ConnectionInitSQL = connectionSQL
 	}
-	return engineCfg
+	return engineCfg, nil
 }
 
 func runServe(cfg porterConfig) error {
 	cfg.DBPath = normalizeDBPath(cfg.DBPath)
+	cfg.DuckLake = cfg.DuckLake.Normalize()
+	if err := cfg.DuckLake.Validate(); err != nil {
+		return fmt.Errorf("invalid DuckLake configuration: %w", err)
+	}
 	statusAggregator := telemetry.NewAggregator(telemetry.Config{})
 	defer statusAggregator.Close()
 
@@ -98,9 +109,14 @@ func runServe(cfg porterConfig) error {
 		return fmt.Errorf("initialize adbc manager: %w", err)
 	}
 
-	eng, err := engine.New(buildEngineConfig(cfg, adbcManager, statusAggregator))
+	engineCfg, err := buildEngineConfig(cfg, adbcManager, statusAggregator)
 	if err != nil {
-		if cfg.DuckLake {
+		return fmt.Errorf("build engine configuration: %w", err)
+	}
+
+	eng, err := engine.New(engineCfg)
+	if err != nil {
+		if cfg.DuckLake.Enabled {
 			return fmt.Errorf("initialize DuckLake: %w", err)
 		}
 		return fmt.Errorf("create engine: %w", err)
@@ -109,8 +125,8 @@ func runServe(cfg porterConfig) error {
 
 	flightAddr := fmt.Sprintf(":%d", cfg.Port)
 	fmt.Printf("Starting Porter FlightSQL server on %s with DuckDB database at %q\n", flightAddr, cfg.DBPath)
-	if cfg.DuckLake {
-		fmt.Printf("DuckLake enabled with metadata path %q\n", cfg.DuckLakePath)
+	if cfg.DuckLake.Enabled {
+		fmt.Printf("DuckLake enabled (catalog=%s dsn=%q name=%q data_path=%q)\n", cfg.DuckLake.CatalogType, cfg.DuckLake.CatalogDSN, cfg.DuckLake.Name, cfg.DuckLake.DataPath)
 	}
 
 	lis, err := net.Listen("tcp", flightAddr)

@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	internaladbc "github.com/TFMV/porter/internal/adbc"
+	internalducklake "github.com/TFMV/porter/internal/ducklake"
 	apacheadbc "github.com/apache/arrow-adbc/go/adbc"
 	"github.com/apache/arrow-adbc/go/adbc/drivermgr"
 	"github.com/spf13/viper"
@@ -19,8 +20,7 @@ type porterConfig struct {
 	WsPort       int
 	StatusEnable bool
 	StatusPort   int
-	DuckLake     bool
-	DuckLakePath string
+	DuckLake     internalducklake.Config
 }
 
 func loadConfig() porterConfig {
@@ -31,8 +31,13 @@ func loadConfig() porterConfig {
 		WsPort:       viper.GetInt("ws-port"),
 		StatusEnable: viper.GetBool("status"),
 		StatusPort:   viper.GetInt("status-port"),
-		DuckLake:     viper.GetBool("ducklake"),
-		DuckLakePath: viper.GetString("ducklake-path"),
+		DuckLake: internalducklake.Config{
+			Enabled:     viper.GetBool("ducklake"),
+			CatalogType: viper.GetString("ducklake-catalog-type"),
+			CatalogDSN:  viper.GetString("ducklake-catalog-dsn"),
+			DataPath:    viper.GetString("ducklake-data-path"),
+			Name:        viper.GetString("ducklake-name"),
+		}.Normalize(),
 	}
 }
 

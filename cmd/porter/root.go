@@ -38,7 +38,10 @@ func init() {
 	rootCmd.PersistentFlags().Bool("status", true, "Enable live status endpoint")
 	rootCmd.PersistentFlags().Int("status-port", 9091, "Status server port")
 	rootCmd.PersistentFlags().Bool("ducklake", false, "Enable DuckLake at server startup")
-	rootCmd.PersistentFlags().String("ducklake-path", "metadata.ducklake", "DuckLake metadata path")
+	rootCmd.PersistentFlags().String("ducklake-catalog-type", "duckdb", "DuckLake catalog type: duckdb, sqlite, postgres, mysql")
+	rootCmd.PersistentFlags().String("ducklake-catalog-dsn", "metadata.ducklake", "DuckLake catalog DSN or file path")
+	rootCmd.PersistentFlags().String("ducklake-data-path", "", "DuckLake data path for Parquet/object storage")
+	rootCmd.PersistentFlags().String("ducklake-name", "my_ducklake", "Attached DuckLake catalog name")
 
 	if err := viper.BindPFlag("db", rootCmd.PersistentFlags().Lookup("db")); err != nil {
 		fmt.Fprintln(os.Stderr, err)
@@ -68,7 +71,19 @@ func init() {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
-	if err := viper.BindPFlag("ducklake-path", rootCmd.PersistentFlags().Lookup("ducklake-path")); err != nil {
+	if err := viper.BindPFlag("ducklake-catalog-type", rootCmd.PersistentFlags().Lookup("ducklake-catalog-type")); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	if err := viper.BindPFlag("ducklake-catalog-dsn", rootCmd.PersistentFlags().Lookup("ducklake-catalog-dsn")); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	if err := viper.BindPFlag("ducklake-data-path", rootCmd.PersistentFlags().Lookup("ducklake-data-path")); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	if err := viper.BindPFlag("ducklake-name", rootCmd.PersistentFlags().Lookup("ducklake-name")); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
@@ -79,7 +94,10 @@ func init() {
 	viper.SetDefault("status", true)
 	viper.SetDefault("status-port", 9091)
 	viper.SetDefault("ducklake", false)
-	viper.SetDefault("ducklake-path", "metadata.ducklake")
+	viper.SetDefault("ducklake-catalog-type", "duckdb")
+	viper.SetDefault("ducklake-catalog-dsn", "metadata.ducklake")
+	viper.SetDefault("ducklake-data-path", "")
+	viper.SetDefault("ducklake-name", "my_ducklake")
 
 	viper.SetEnvPrefix("PORTER")
 	viper.AutomaticEnv()
@@ -112,7 +130,19 @@ func init() {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
-	if err := viper.BindEnv("ducklake-path"); err != nil {
+	if err := viper.BindEnv("ducklake-catalog-type"); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	if err := viper.BindEnv("ducklake-catalog-dsn"); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	if err := viper.BindEnv("ducklake-data-path"); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	if err := viper.BindEnv("ducklake-name"); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
