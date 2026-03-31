@@ -172,7 +172,8 @@ porter --ws                        # Flight SQL + WebSocket
 porter serve --ws                   # Same as above
 porter serve --ws --ws-port 9090   # Custom WebSocket port
 porter serve --status-port 9191    # Custom status surface
-porter serve --ducklake --ducklake-path ./metadata.ducklake
+porter serve --ducklake --ducklake-catalog-type duckdb --ducklake-catalog-dsn ./metadata.ducklake
+porter serve --ducklake --ducklake-catalog-type sqlite --ducklake-catalog-dsn ./catalog.sqlite --ducklake-data-path ./ducklake-data
 ```
 
 ### Full Flags
@@ -186,7 +187,10 @@ porter serve --ducklake --ducklake-path ./metadata.ducklake
 | `--status` | Enable live status surface | `true` |
 | `--status-port` | Status server port | `9091` |
 | `--ducklake` | Enable DuckLake during server startup | `false` |
-| `--ducklake-path` | DuckLake metadata path | `metadata.ducklake` |
+| `--ducklake-catalog-type` | DuckLake metadata backend: `duckdb`, `sqlite`, `postgres`, `mysql` | `duckdb` |
+| `--ducklake-catalog-dsn` | DuckLake metadata DSN or file path | `metadata.ducklake` |
+| `--ducklake-data-path` | DuckLake Parquet/object storage path | empty |
+| `--ducklake-name` | Attached DuckLake catalog name | `my_ducklake` |
 
 ### Execute a query
 
@@ -221,18 +225,47 @@ porter schema table_name
 * `PORTER_STATUS`
 * `PORTER_STATUS_PORT`
 * `PORTER_DUCKLAKE`
-* `PORTER_DUCKLAKE_PATH`
+* `PORTER_DUCKLAKE_CATALOG_TYPE`
+* `PORTER_DUCKLAKE_CATALOG_DSN`
+* `PORTER_DUCKLAKE_DATA_PATH`
+* `PORTER_DUCKLAKE_NAME`
 
 ### DuckLake Startup
 
-When `--ducklake` is enabled, Porter initializes DuckLake during server startup and keeps the existing FlightSQL/Arrow execution path unchanged.
+When `--ducklake` is enabled, Porter initializes DuckLake during server startup and keeps the existing FlightSQL/Arrow execution path unchanged. DuckLake is treated as database configuration, not as a separate query mode.
+
+Supported catalog backends:
+
+* `duckdb`
+* `sqlite`
+* `postgres`
+* `mysql`
+
+Examples:
+
+```bash
+porter serve --ducklake \
+  --ducklake-catalog-type duckdb \
+  --ducklake-catalog-dsn ./metadata.ducklake
+
+porter serve --ducklake \
+  --ducklake-catalog-type sqlite \
+  --ducklake-catalog-dsn ./catalog.sqlite \
+  --ducklake-data-path ./ducklake-data
+
+porter serve --ducklake \
+  --ducklake-catalog-type postgres \
+  --ducklake-catalog-dsn postgres://user:pass@host/db \
+  --ducklake-data-path s3://bucket/prefix \
+  --ducklake-name my_ducklake
+```
 
 Startup initialization:
 
 ```sql
 INSTALL ducklake;
 LOAD ducklake;
-ATTACH 'ducklake:<path>' AS my_ducklake;
+ATTACH 'ducklake:<catalog>' AS my_ducklake (DATA_PATH '...');
 USE my_ducklake;
 ```
 
@@ -240,10 +273,20 @@ Per-connection initialization:
 
 ```sql
 LOAD ducklake;
+LOAD <catalog-extension>;
 USE my_ducklake;
 ```
 
-That keeps DuckLake as a database configuration concern instead of introducing any alternate query or transport flow.
+DuckLake inspection and maintenance functions are available through the existing SQL path, for example:
+
+```sql
+FROM ducklake_snapshots('my_ducklake');
+SELECT * FROM ducklake_table_info('my_ducklake');
+SELECT * FROM my_table AT (VERSION => 2);
+CALL ducklake_merge_adjacent_files('my_ducklake');
+CALL ducklake_expire_snapshots('my_ducklake', dry_run => true);
+CALL ducklake_cleanup_old_files('my_ducklake', dry_run => true, cleanup_all => true);
+```
 
 ---
 
